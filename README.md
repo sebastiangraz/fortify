@@ -9,7 +9,7 @@ filters, layout or encoders.
 
 > **Status: first draft (2026-10-05).** The core attack, codec proxy, service, CLI, TS
 > client and eval harness are written. What has been run so far is in
-> [Status](#status). Next is **Phase 0** (baseline red-team), in [Roadmap](#roadmap).
+> [Status](#status). Phase 0 (baseline red-team) is done; next is **Phase 1**, in [Roadmap](#roadmap).
 
 ---
 
@@ -277,7 +277,8 @@ src/fortify/
   service.py         FastAPI app
   cli.py             fortify selftest | vaccinate | serve
 tests/               pytest: attack invariants, codec proxy, wire format, service contract (toy surrogate)
-eval/                red-team harness: run.py, removers.py, README.md (protocol and metrics)
+eval/                red-team harness: run.py, removers.py, export_cases.ts (cases from Mark), score.py /
+                     score_clip.py (hand-run tools), video_masks.py, README.md (protocol and metrics)
 packages/client/     @fortify/client (TS, zero deps, bun test)
 deploy/              Dockerfile (uv, cu128) and modal_app.py (serverless GPU, draft)
 weights/             downloaded model files (gitignored)
@@ -359,8 +360,82 @@ What has actually been run is recorded here. Keep it current.
       | `lama` | fill MSE in the hole 0 → 0.020 (≈ 36/255 RMS), so the fill is pushed well off the clean plate | ~350 | 4.1 GiB |
       | `sam` (sam2.1-hiera-large) | ClipMSE 70 → 33; no preprocessing-drift warning, so stretch/pad detection matched | ~750 | 24.5 GiB |
       | `florence2` (florence-community/Florence-2-large) | detected the box on clean; loc-token CE 0.95 → 3.77 | **~41 000** | **34.3 GiB**, over the 32 GB card, spilling to shared memory |
-- [ ] Phase 0 baseline numbers
+- [x] **Phase 0 baseline red-team (2026-10-06).** Results are in
+      [Phase 0 results](#phase-0-results-2026-10-06) below.
 - [ ] Timing per group per preset with the full ensemble
+
+### Phase 0 results (2026-10-06)
+
+**Setup**
+- **Cases:** 24 frames from `eval/export_cases.ts`, through videotools' real Mark graph.
+  - Filters: plain ×7, glass ×10, blur ×7.
+  - Sizes: small ×6, medium ×11, large ×7.
+  - Backgrounds: Sintel (1920×816), Kodak photos (768×512, stills), videotools' smoke assets.
+  - Logo: the smoke `logo.png`, a white "S + GRAZ" wordmark.
+- **Delivery:** every frame went through x264 CRF 23 before removal. CRF 28 gave the same
+  picture.
+- **"Removed"** means `mark_residual` < 0.2, checked against the images. `removal_score`
+  under-reads faint marks; see eval/README "Metrics".
+- **Outputs:** `runs/p0-h264-23`, `runs/p0-h264-28`, `runs/p0-wild` (hand-run tools) and
+  `runs/p0-video`.
+
+**Frames: cases removed out of 24**
+
+| attacker | mask from | removed | what's left |
+|---|---|---|---|
+| `oracle-lama`, `sam-lama`, IOPaint LaMa / MAT | a box drawn or dragged by hand | 21–22 | nothing visible; the misses are blur-metric artefacts (kodim08, kodim15). Visually 24/24 |
+| IOPaint SD 1.5 inpainting, empty prompt | same box | 17 | the mark is gone, but on dark backgrounds SD paints sign-like junk in the hole (a re-roll fixes it) |
+| WatermarkRemover-AI, default (Florence-2 "watermark" → LaMa) | automatic | 18 | large logos (Florence-2 boxes only the "S" symbol, not "GRAZ") and faint blur |
+| WatermarkRemover-AI, run twice | automatic | 21 | kodim15 blur-large over a face still partly visible |
+| WatermarkRemover-AI `--mask-mode stroke --double-pass` | automatic | 17 | worse on blur: the stroke mask misses faint strokes |
+| `florence-lama` (harness) | automatic | 17 | same failure modes as WatermarkRemover-AI |
+
+**Clips: share of frames with the mark still visible**
+
+ProPainter ran at `--resize_ratio 0.5`, pasted back inside the mask.
+
+| clip (CRF 23) | WatermarkRemover-AI video (detect every frame) | SAM2 box on frame 0, propagated → ProPainter | hand mask per frame → ProPainter |
+|---|---|---|---|
+| Sintel desert, glass, static | 21% ¹ | 0% (SAM2 covers 98% of the mark) | 0% |
+| Sintel desert, glass, rotating | 24% ¹ | **65%** (SAM2 covers 33%: it loses the mark at the first jump) | 0% ² |
+| smoke, plain, static | 0% | 0% (covers 100%) | 0% |
+| smoke, plain, rotating | 1% | **49%** (covers 50%) | 0% |
+
+¹ The last 1.2 s only. When the trailer's "SINTEL" title fades in, Florence-2 removes the title
+  instead of GRAZ. That's competing on-screen text, not anything about Mark.
+² The metric flags 19% of frames, but those are ProPainter fill blotches as the scene darkens.
+  No mark is left.
+
+**Answer to the Phase 0 question**
+- **Glass refraction resists nothing.** Glass came off as cleanly as plain in every pipeline
+  (10/10 with a hand mask). Florence-2 still detects it, and inpainters fill from the ring, so
+  the refraction never matters. Don't count glass as protection.
+- **Blur resists automatic detection only, and only partly.** Faint blur marks over texture
+  (kodim08 small, kodim15 large) slip past Florence-2 and stroke masks. With a hand box they come
+  off like the rest.
+- **Large size beats Florence-2 by accident.** On large wordmarks, Florence-2 boxes the symbol
+  and leaves the text. A second pass of the same tool fixes it.
+- **Rotation resists only "click once and propagate" video tools.** SAM2 tracks a static mark
+  through the clip, but loses it at the first jump. The attacker has to re-prompt every stay
+  (2 s), which is a real cost on long clips. Rotation does nothing against per-frame detection
+  (WatermarkRemover-AI's video mode) or per-frame masks: ProPainter then removes it completely.
+- **Compression doesn't help.** CRF 28 vs 23 changed nothing.
+
+**What this means for fortify's targets**
+- **Hand-mask attackers** remove every Mark variant today. Only an inpainter-disrupting term
+  (`lama`, held-out MAT/SD for transfer) can raise their cost; detection suppression can't.
+- **Florence-2 is the gate for the common automatic tool**, and it already wobbles on large and
+  blur marks. Suppressing it is high leverage, so making the `florence2` surrogate affordable
+  (see the bottleneck note below) stays Phase 1's first job.
+- **`sam` matters for static marks.** Rotating output already defeats single-prompt SAM2
+  propagation. Phase 2 should prioritise `sam` for non-rotating jobs, and per stay (the first
+  frames of each stay are where an attacker re-prompts).
+- **Limits of this baseline:**
+  - one logo;
+  - CGI and low-res photo backgrounds, no live action;
+  - SD with an empty prompt only;
+  - ProPainter at half resolution;
+  - two clips.
 
 Findings and known issues:
 - **"Disrupting" losses need a random start.** The `lama`/`toy` losses compare against
@@ -385,17 +460,20 @@ Findings and known issues:
 - **Download stalls:** Hugging Face's Xet CDN failed once mid-download. Setting
   `HF_HUB_DISABLE_XET=1` fixed it.
 - SAM2 load prints a harmless "`sam2_video` to instantiate `sam2`" notice.
+- `eval/removers.py` `florence_lama` works on the native Florence-2 processor
+  (`post_process_generation` parses boxes; verified in Phase 0).
+- **videotools quirk (not fixed there):** a plain mark on yuv420p lands 1 px up/left of
+  `watermarkLayout`'s corner when that corner is odd, because overlay floors to even.
+  Glass and blur cells are even by construction.
 
 Still unverified:
-- `eval/removers.py` `florence_lama`: `processor.post_process_generation` on the native
-  processor (written against the remote-code API).
 - Whether `labels = generated[:, 1:]` is exactly aligned with the native Florence-2 decoder.
   The loss behaves as expected, but check token-by-token.
 - The DCT-JPEG proxy's quality range vs real x264.
 - Weight balance of the ensemble (term scales differ by about 10³).
 
 ## Roadmap
-- **Phase 0, baseline red-team (do first; it decides scope).**
+- **Phase 0, baseline red-team: done 2026-10-06, results in [Status](#phase-0-results-2026-10-06).**
   - Export about 20 cases from videotools (plain, glass and blur × sizes × backgrounds)
     and run `eval/run.py` without `--shield`.
   - Also run WatermarkRemover-AI, IOPaint (LaMa/MAT/SD) and SAM2 + ProPainter by hand.

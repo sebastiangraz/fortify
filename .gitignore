@@ -8,3 +8,4 @@ runs/
 eval/data/
 node_modules/
 packages/client/dist/
+eval/tools/

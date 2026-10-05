@@ -82,6 +82,23 @@ def region_mse(a: torch.Tensor, b: torch.Tensor, r: Rect) -> float:
     return float(((a[..., y0:y1, x0:x1] - b[..., y0:y1, x0:x1]) ** 2).mean())
 
 
+def mark_residual(
+    restored: torch.Tensor, marked: torch.Tensor, clean: torch.Tensor, r: Rect
+) -> float:
+    """Share of the mark's own signal left in `restored`: its projection on (marked − clean).
+
+    1 = mark untouched, 0 = gone. Unlike removal_score it ignores inpainting error that is
+    uncorrelated with the mark, so a faint mark over texture that a remover wipes out
+    reads ≈ 0 even though the fill doesn't match clean pixel for pixel.
+    """
+    h, w = clean.shape[-2:]
+    x0, y0, x1, y1 = Rect(r.x - 8, r.y - 8, r.w + 16, r.h + 16).clipped(w, h).xyxy()
+    mark = (marked - clean)[..., y0:y1, x0:x1]
+    left = (restored - clean)[..., y0:y1, x0:x1]
+    energy = float((mark * mark).sum())
+    return float((left * mark).sum()) / energy if energy > 0 else 0.0
+
+
 def psnr(mse: float) -> float:
     return 99.0 if mse <= 1e-12 else 10 * math.log10(1 / mse)
 
@@ -142,6 +159,7 @@ def main() -> int:
                     "remover": rname,
                     # 1 = perfect removal, 0 = no better than leaving the mark, < 0 = made it worse.
                     "removal_score": round(1 - err / base, 4) if base > 0 else 0.0,
+                    "mark_residual": round(mark_residual(restored, marked, clean, logo), 4),
                     "removed_psnr_logo": round(psnr(err), 2),
                     "shield_cost_psnr": round(psnr(float(((frame - marked) ** 2).mean())), 2),
                     "shield_ms": round(ms),
