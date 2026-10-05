@@ -1,0 +1,42 @@
+[project]
+name = "fortify"
+version = "0.1.0"
+description = "Adversarial anti-removal perturbations for visible video watermarks (Mark)."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "torch>=2.8",
+  "numpy>=2.1",
+  "pillow>=11",
+]
+
+[project.optional-dependencies]
+# Surrogate removers: Florence-2 (detector), SAM / SAM2 (segmenter). LaMa is a TorchScript file.
+# Florence-2's remote code imports timm and einops.
+models = ["transformers>=4.56", "timm>=1.0", "einops>=0.8", "accelerate>=1.0"]
+serve = ["fastapi>=0.115", "uvicorn>=0.32"]
+
+[project.scripts]
+fortify = "fortify.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.8", "httpx>=0.28"]
+
+# RTX 50xx (Blackwell, sm_120) needs CUDA 12.8+ wheels.
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[build-system]
+requires = ["uv_build>=0.9,<0.10"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
