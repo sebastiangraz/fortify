@@ -9,7 +9,8 @@ filters, layout or encoders.
 
 > **Status: first draft (2026-10-05).** The core attack, codec proxy, service, CLI, TS
 > client and eval harness are written. What has been run so far is in
-> [Status](#status). Phase 0 (baseline red-team) is done; next is **Phase 1**, in [Roadmap](#roadmap).
+> [Status](#status). Phases 0 (baseline red-team) and 1 (single-frame shield) are done;
+> next is **Phase 2**, in [Roadmap](#roadmap).
 
 ---
 
@@ -135,18 +136,49 @@ targets) and returns `loss(x_adv)`.
 | name | stands in for | loss (minimised) | default weight |
 |---|---|---|---|
 | `lama` | LaMa inpainting with a dilated box mask (8 px) | −MSE between LaMa's fill on x_adv and its fill on clean, inside the hole (DWV-style: push the fill away from the plausible clean plate) | 1.0 |
-| `sam` | SAM / SAM2 with the logo box as prompt | Attack-SAM ClipMSE: Σ relu(logit + τ)² over the (dilated) logo, τ = 2, so the mask comes back empty | 0.5 |
-| `florence2` | Florence-2 `<OPEN_VOCABULARY_DETECTION>` with "watermark" / "logo" | −CE of the clean output's `<loc_*>` tokens, capped at 12, so it stops repeating its boxes. Prompts with no detection on clean are skipped | 0.05 |
+| `sam` | SAM / SAM2 with the logo box as prompt | Attack-SAM ClipMSE: Σ relu(logit + τ)² over the (dilated) logo, τ = 2, so the mask comes back empty | 1.0 |
+| `florence2` | Florence-2 `<OPEN_VOCABULARY_DETECTION>` with "watermark" / "logo", on the whole frame | **targeted decoy**: CE of the clean answer with every box that covers the logo swapped for a decoy box in the ring beside it (see below) | 1.0 |
 | `toy` | a fixed random conv net | for tests and `selftest`; no weights | — |
 | `null` | nothing | constant loss ⇒ δ ≡ 0 exactly; for consumer smoke tests | — |
 
-- The ensemble is a weighted sum: `FORTIFY_SURROGATES="lama:1,sam:0.5,florence2:0.05"`.
-- The weights are **untuned first guesses**: the terms have very different scales (LaMa
-  MSE ~0.01, CE ~10, ClipMSE up to ~100). Tune them with eval/.
+- **The ensemble is a weighted sum with balanced gradients**:
+  `FORTIFY_SURROGATES="lama:1,florence2:1"`.
+  - pgd backpropagates each surrogate on its own (`attack.SumLoss`). That keeps memory at
+    one surrogate's graph and one EOT sample at a time.
+  - Each surrogate's gradient is scaled to unit mean |g| before weighting. A weight is then
+    that surrogate's share of the step, whatever its loss scale (LaMa MSE ~0.01, CE ~10,
+    ClipMSE ~100).
+  - Without balancing, Florence-2's gradient drowned LaMa's: its loss stayed at −0.0002, against
+    −0.54 when run alone. The weights themselves (1:1) are still untuned.
+- **`florence2` targets a decoy.**
+  - Florence-2 OVD always answers with a box. Even on frames without a mark it boxes some
+    other object, so "no box" is off-distribution.
+  - Untargeted ascent on the clean answer (the first draft) moved boxes instead. On sintel03
+    it grew the box from the "S" alone to the whole wordmark.
+  - So bind() swaps each logo-covering box's four `<loc_*>` tokens for a decoy: the biggest ring
+    strip beside the logo, 16 px clear of it and clear of the feathered border. PGD then
+    descends the CE of the location tokens. WatermarkRemover-style tools inpaint the decoy
+    strip and leave the mark.
+- **`florence2` needs the View** (`surrogates.View`: frame size, the crop's place in it, and a
+  thumbnail of the frame; API field `view`, CLI `--view`/`--background`).
+  - The real tool runs on the whole frame shrunk to 768². With a View, the surrogate builds that
+    picture: the thumbnail, with the crop pasted in at its place.
+  - On a 1920×816 frame that's a 2.5× downscale of the logo. The crop stretched to 768² is a
+    different picture at a different scale. In Phase 1, δ optimized on the crop view did
+    nothing to full-frame detection, even before any codec.
+  - Without a View, florence2 falls back to the crop view.
+- **Florence-2 cost:**
+  - The vision tower runs once per frame, and its features are shared by both prompts.
+  - Frames are batched per prompt, and backpropagated in chunks of 2 frames.
+  - One frame with 2 prompts costs ~180 ms forward + backward on the 5090; peak VRAM is
+    7.4 GiB with lama.
+  - bf16 autocast was no faster at 1–3 frames, and its gradient agreed with fp32 in sign on only
+    ~75% of pixels, so it stays fp32.
 - **Preprocessing is redone in torch** (resize + ImageNet normalisation) so gradients
   reach the pixels.
-  - `bind()` compares it against the real Hugging Face processor and warns if the max
-    difference is > 0.1.
+  - `bind()` compares it against the real Hugging Face processor and warns on a mismatch:
+    max difference > 0.1 for SAM, mean > 0.01 for Florence-2. Torch and PIL bicubic differ
+    by up to 0.15 on sharp edges of real frames, with a mean of ~0.001.
   - The SAM wrapper tries both "pad longest side to 1024" (SAM) and "stretch to 1024²"
     (SAM2) and keeps whichever matches.
 - **Models:**
@@ -182,11 +214,18 @@ Headers: `Authorization: Bearer $FORTIFY_TOKEN` (required when the server has
     {
       "id": "stay-0",                    // echoed back, ≤ 64 chars
       "logo": { "x": 48, "y": 40, "w": 260, "h": 120 },  // mark rect inside the crop
-      "frames": ["<base64 PNG>", "..."]  // 1..8 crops, same size, ≤ 1024×1024 px
+      "frames": ["<base64 PNG>", "..."], // 1..8 crops, same size, ≤ 1024×1024 px
+      "view": {                          // optional; florence2 needs it (§3.5)
+        "frame": { "w": 1920, "h": 1080 },   // full frame size
+        "at": { "x": 1490, "y": 576 },       // the crop's top-left in the frame
+        "background": "<base64 PNG>"         // optional: the whole frame, any size ≤ 1024×1024 px
+      }
     }
   ]
 }
 ```
+`view` was added in Phase 1 as an optional field, so `version` stays 1. Without
+`background`, the surrogate fills the rest of the frame with the crop's mean colour.
 Response `200`:
 ```jsonc
 {
@@ -198,9 +237,10 @@ Response `200`:
 }
 ```
 Errors:
-- `400`: unreadable frame, frames differ in size, or logo rect outside the crop.
+- `400`: unreadable frame or background, frames differ in size, logo rect outside the
+  crop, or crop outside the view's frame.
 - `401`: bad token.
-- `413`: crop too large.
+- `413`: crop or background too large.
 - `422`: schema violation (FastAPI).
 - `5xx`: server fault.
 
@@ -237,6 +277,7 @@ import { createClient } from "@fortify/client";
 const fortify = createClient({ url: process.env.FORTIFY_URL!, token: process.env.FORTIFY_TOKEN, timeoutMs: 120_000 });
 const { deltas } = await fortify.vaccinate({ strength: "medium", groups, signal });
 // deltas[i].png: Uint8Array (PNG), deltas[i].eps, deltas[i].id
+// groups[i].view = { frame: { w, h }, at: { x, y }, background?: Uint8Array /* PNG */ }
 ```
 - Zero dependencies; built with `tsc`.
 - Not published yet. Consume it via a `file:`/git dependency, or publish it to a private
@@ -252,7 +293,9 @@ repos will change:
 2. **Rects.** For each rotation stay (or the whole clip if the mark doesn't move), take
    the mark rect from Mark's layout code, then `crop_around` it (port the formula above).
 3. **Sample.** With one ffmpeg call over the watermarked graph, export ~3 frames per stay,
-   cropped to that rect, as PNG.
+   cropped to that rect, as PNG. Also export one whole frame per stay, scaled to ≤ 1024 px
+   on its long side, as the `view.background`. Send `view.frame` and `view.at` too.
+   Without them, the Florence-2 term attacks the wrong picture (§3.5).
 4. **Call** `vaccinate` with one group per stay, under a hard time budget. Mark has 300 s
    per request with ~240 s of encode budget; give fortify a slice, e.g. ≤ 120 s.
 5. **Apply.** Write the δ PNGs to the job's workDir as extra ffmpeg inputs and blend them
@@ -272,7 +315,7 @@ src/fortify/
   region.py          Rect, crop_around, box_mask, feather
   imageio.py         PNG ⇄ tensor, δ wire encoding
   models.py          frozen model loaders (LaMa TorchScript, Florence-2, SAM/SAM2), normalisation
-  surrogates/        base (Context, Ensemble), lama, sam, florence2, toy/null, registry
+  surrogates/        base (Context, View, Ensemble), lama, sam, florence2, toy/null, registry
   vaccinate.py       presets + one group → one δ
   service.py         FastAPI app
   cli.py             fortify selftest | vaccinate | serve
@@ -297,13 +340,15 @@ uv run fortify selftest                     # torch/CUDA check + PGD on the toy 
 uv run pytest                               # unit tests (CPU fine)
 uv run ruff check .
 
-# one group by hand: crops of the same rect from a few frames, logo rect inside the crop
+# one group by hand: crops of the same rect from a few frames, logo rect inside the crop,
+# plus where the crop sits in the full frame (W,H,X,Y) and a thumbnail of that frame
 uv run fortify vaccinate --frames a.png b.png c.png --logo 48,40,260,120 --strength medium \
-  --surrogates lama,sam,florence2 --out runs/try1
-#   → runs/try1/delta.png (wire format), delta_x8.png (amplified view), shielded_*.png
+  --view 1920,816,1490,576 --background thumb.png --surrogates lama,florence2 --out runs/try1
+#   → runs/try1/delta.png (wire format), delta_x8.png (amplified view), shielded_*.png;
+#     prints each surrogate's loss (first → last step) and peak VRAM
 
 uv run fortify serve --port 8765            # HTTP API; set FORTIFY_TOKEN for auth
-uv run python eval/run.py --data eval/data --codec h264:23 [--shield medium]
+uv run python eval/run.py --data eval/data --codec h264:23[,none] [--shield medium] [--cases 'sintel*']
 
 cd packages/client && bun install && bun test && bun run build
 ```
@@ -362,7 +407,95 @@ What has actually been run is recorded here. Keep it current.
       | `florence2` (florence-community/Florence-2-large) | detected the box on clean; loc-token CE 0.95 → 3.77 | **~41 000** | **34.3 GiB**, over the 32 GB card, spilling to shared memory |
 - [x] **Phase 0 baseline red-team (2026-10-06).** Results are in
       [Phase 0 results](#phase-0-results-2026-10-06) below.
-- [ ] Timing per group per preset with the full ensemble
+- [x] **Phase 1 single-frame shield, `lama` + `florence2` (2026-10-06).** Results are in
+      [Phase 1 results](#phase-1-results-2026-10-06) below. `pytest` 15 passed, `bun test` 4 pass,
+      ruff and tsc clean.
+- [ ] Timing per group per preset with the full ensemble (`sam` included)
+
+### Phase 1 results (2026-10-06)
+
+**Florence-2 is affordable now.** It took four changes:
+- It loses the 41 s/step: that was VRAM spill, not compute. One fwd+bwd is ~150 ms on the 5090,
+  but all 8 frame × prompt × EOT graphs were held at once, ~3.5 GiB each.
+- pgd backpropagates per EOT sample and per surrogate (`attack.SumLoss`).
+- The vision tower runs once per frame and is shared by both prompts.
+- `florence2` and `lama` both backpropagate in chunks of 2 frames.
+
+Measured on the largest Phase 0 crop (976×418), `lama,florence2`, medium preset:
+
+| frames per group | s / PGD step | ≈ medium (50 steps) | peak VRAM (alloc / reserved) |
+|---|---|---|---|
+| 1 | 0.70 | 35 s | 7.5 / 8.9 GiB |
+| 3 | 1.34 | 67 s | 11.5 / 14.5 GiB |
+| 8 | 2.88 | 144 s | 11.9 / 15.1 GiB |
+
+- Memory is bounded at any group size. Time is not: 3 frames × several stays won't fit in
+  the ~120 s slice §5 gives fortify. That's Phase 3's problem (fewer steps, alternating
+  surrogates, Florence-2-base, or async jobs).
+- Over the 24 single-frame eval groups (smaller crops), shielding took 30 s on average and
+  43 s at most.
+
+**What made `florence2` work at all.** These were fixed before the eval; see §3.5 for the
+mechanism:
+1. **Untargeted ascent (the first draft) moves boxes and can make them better for the
+   attacker.** On sintel03's crop view, Florence-2 boxed only the "S" on the clean frame; on the
+   shielded one, it boxed the whole wordmark. → targeted decoy loss.
+2. **The crop view doesn't transfer.** A florence2-only δ that wrecked the CE on the crop
+   left full-frame detection untouched (same box, coverage 1.0), even without a codec. → the
+   View: the attacker's whole-frame picture, rebuilt from a thumbnail.
+3. **Without balancing, Florence-2's gradient drowned LaMa's.** In a joint run, lama reached
+   −0.0002, against −0.86 alone. → gradients balanced per surrogate.
+
+A budget sweep for the decoy (sintel03 and kodim05, real detector, `florence2` alone):
+- **Sintel:** ε = 8, grid 2 (medium) gets the decoy CE down but doesn't flip the beam-search
+  answer.
+  - ε = 8 at grid 1 with 100 steps, ε = 12 with EOT, and ε = 16 all flip it to the decoy, and the
+    flip survives x264 CRF 23.
+  - At 1920 px, Florence-2's own 2.5× downscale already low-passes δ, so grid 2 is an extra
+    handicap there.
+- **kodim05:** nothing at ε = 8 flipped it. The crop is small (214×120) and isn't downscaled.
+
+**Eval:** `eval/run.py --shield medium --surrogates lama,florence2 --codec h264:23,none`.
+- All 24 Phase 0 cases, single frame, with a View (1024 px thumbnail).
+- Output in `runs/p1-medium`; `_sheet.png` there is a contact sheet of restored crops.
+- Shield cost: PSNR 46.2 dB on average, 40.2 dB at worst (large logos, whose crops are big).
+
+Cases out of 24 (marked → shielded). Removal counts as successful when `removal_score` > 0.5,
+because a broken fill reads as a large negative score. Mask moves are cases where the
+remover's mask went from covering the logo (≥ 0.5) to missing it, or back.
+
+| attacker | h264:23 removed | no codec removed | mask moved off / onto the logo (h264:23) |
+|---|---|---|---|
+| `oracle-lama` (hand box) | 19 → **8** | 21 → 6 | — |
+| `florence-lama` (WatermarkRemover-style) | 17 → 15 | 17 → 11 | **4 off / 3 onto** (no codec: 8 / 2) |
+| `sam-lama` (box prompt → SAM mask) | 21 → 19 | 21 → 19 | 0 / 0 |
+
+What the numbers and images say:
+- **`lama` is the strong term, and it survives H.264.**
+  - With the attacker's own hand-drawn box, LaMa's fill breaks into a flat bright or dark slab
+    where the logo was: sintel03 ×2, sintel12-blur, sintel26-glass, sintel37-glass, sintel40.
+  - That's the first thing in this project that hurts the hand-mask attacker.
+  - It works well on Sintel and smoke, and barely at all on Kodak photos (kodim05, kodim19,
+    kodim20: fill still clean). The lama loss there stays at −0.03 to −0.2, against −0.4 to −0.8 on
+    Sintel.
+  - On plain marks `removal_score` stays high even when the fill is broken, because the white
+    logo makes the baseline error huge. Check `removed_psnr_logo` (e.g. sintel22-plain-large
+    38 → 13 dB) or the sheet.
+- **The lama δ is mask-specific.** `sam-lama` runs the same LaMa with a stroke-shaped SAM mask
+  (dilated 8 px) instead of the box, and is untouched. The surrogate only ever trained on
+  the dilated box. → EOT over mask shapes (Phase 2).
+- **`florence2` works in both directions.**
+  - Where it works, Florence-2 boxes the decoy strip and the mark survives: gradient-blur,
+    sintel26 ×2 and sintel40 under H.264; 8 cases without a codec.
+  - On three large logos (kodim13, sintel19, sintel22-plain-large) it backfires. Florence-2 on
+    the clean frame boxed only the "S" (coverage 0.24 to 0.27), the decoy target replaced that
+    box, and the attack landed on the whole wordmark instead (coverage 1.0). The same failure as
+    untargeted ascent.
+  - H.264 halves its effect: 8 wins without a codec, 4 with.
+  - At ε = 8, medium is below the budget the decoy needs (see the sweep above).
+- **The decoy is visible.** It paints a faint ghost of the wordmark into the decoy strip. It shows in
+  the delivered frame on flat or dark backgrounds (smoke4, sintel12-glass, sintel26-glass, the
+  sintel03 CLI run), despite 46 dB PSNR. PSNR is the wrong cost metric for a structured δ.
 
 ### Phase 0 results (2026-10-06)
 
@@ -426,7 +559,7 @@ ProPainter ran at `--resize_ratio 0.5`, pasted back inside the mask.
   (`lama`, held-out MAT/SD for transfer) can raise their cost; detection suppression can't.
 - **Florence-2 is the gate for the common automatic tool**, and it already wobbles on large and
   blur marks. Suppressing it is high leverage, so making the `florence2` surrogate affordable
-  (see the bottleneck note below) stays Phase 1's first job.
+  (see the bottleneck note below) was Phase 1's first job.
 - **`sam` matters for static marks.** Rotating output already defeats single-prompt SAM2
   propagation. Phase 2 should prioritise `sam` for non-rotating jobs, and per stay (the first
   frames of each stay are where an attacker re-prompts).
@@ -442,21 +575,19 @@ Findings and known issues:
   the surrogate's own clean output, so their gradient at δ = 0 is exactly 0. A
   zero-start PGD or FGSM never moves (found and fixed: every preset has `random_start`,
   and `low` is R+FGSM). Keep this in mind for any new DWV-style surrogate.
-- **Florence-2 is the bottleneck. Fix this first in Phase 1.** Its cost comes from 768²
-  input × 2 frames × 2 prompts × 2 EOT samples, all summed before a single backward.
-  Options, roughly in order:
-  - backward per target (accumulate grads instead of summing losses);
-  - bf16 autocast;
-  - one prompt instead of two;
-  - Florence-2-base instead of large;
-  - gradient checkpointing on the vision tower;
-  - fewer steps for this term only, i.e. alternate which surrogates get a step.
+- **Florence-2 was the bottleneck: fixed in Phase 1.** Per-sample and per-surrogate backward,
+  a shared vision tower and 2-frame chunks took it from 41 s/step and 34 GiB to ~0.2 s per
+  frame and step. See [Phase 1 results](#phase-1-results-2026-10-06).
+  - bf16 was tried and rejected (§3.5).
+  - Still untried, if time per group becomes the limit: one prompt instead of two;
+    Florence-2-base; alternating which surrogates get a step.
 - **Florence-2 must come from the native transformers 5 port.** The original
   `microsoft/Florence-2-*` remote code crashes on transformers 5.x
   (`Florence2LanguageConfig ... forced_bos_token_id`), so `models.py` loads
   `Florence2ForConditionalGeneration` from `florence-community/Florence-2-large`.
-- **SAM2 memory:** 24.5 GiB with 2 frames × 2 EOT samples at 1024². Running it with the
-  full ensemble needs per-surrogate backward, or bf16.
+- **SAM2 memory:** 24.5 GiB with 2 frames × 2 EOT samples at 1024², measured before Phase 1.
+  pgd now backpropagates per EOT sample and per surrogate, which should about halve that. `sam`
+  still has no frame chunking; give it a `chunk` like `lama`/`florence2` in Phase 2.
 - **Download stalls:** Hugging Face's Xet CDN failed once mid-download. Setting
   `HF_HUB_DISABLE_XET=1` fixed it.
 - SAM2 load prints a harmless "`sam2_video` to instantiate `sam2`" notice.
@@ -466,11 +597,14 @@ Findings and known issues:
   `watermarkLayout`'s corner when that corner is odd, because overlay floors to even.
   Glass and blur cells are even by construction.
 
+- **Florence-2 label alignment: verified in Phase 1.** Teacher-forced on clean, the logits'
+  argmax reproduces every `<loc_*>` token of the generated answer, except where beam search and
+  greedy disagree on one bin. The hand-built forward (shared image features) matches the
+  model's own `labels=` loss to 1e-3.
+
 Still unverified:
-- Whether `labels = generated[:, 1:]` is exactly aligned with the native Florence-2 decoder.
-  The loss behaves as expected, but check token-by-token.
 - The DCT-JPEG proxy's quality range vs real x264.
-- Weight balance of the ensemble (term scales differ by about 10³).
+- The ensemble weights. Gradients are balanced now, but 1:1 is a guess.
 
 ## Roadmap
 - **Phase 0, baseline red-team: done 2026-10-06, results in [Status](#phase-0-results-2026-10-06).**
@@ -479,18 +613,31 @@ Still unverified:
   - Also run WatermarkRemover-AI, IOPaint (LaMa/MAT/SD) and SAM2 + ProPainter by hand.
   - Question: how much do Mark's rotation and glass refraction already resist removal?
     The answer may change what fortify needs to target.
-- **Phase 1, single-frame shield.** Get `lama` + `florence2` working end to end through
-  the CLI. Compare ε = 8 before and after `jpeg:75` / `h264:23`.
-- **Phase 2, robustness.**
-  - Calibrate the codec proxy.
-  - Add and tune the `sam` surrogate.
-  - Tune the ensemble weights (normalise each term by its value at step 0?).
+- **Phase 1, single-frame shield: done 2026-10-06, results in [Status](#phase-1-results-2026-10-06).**
+  - `lama` + `florence2` end to end through the CLI, with ε = 8 (medium) compared before and
+    after `h264:23`. `jpeg:75` was not run.
+  - Added on the way: the targeted decoy loss, the View (API field `view`), balanced ensemble
+    gradients, and per-sample/per-surrogate/per-chunk backward.
+- **Phase 2, robustness.** Ordered by what Phase 1 showed:
+  - **`lama` over mask shapes.** EOT over the attacker's mask: box at several dilations, a
+    stroke/SAM-like mask. Today's δ doesn't touch `sam-lama`.
+  - **Decoy fixes:**
+    - On large logos where clean Florence-2 boxes only part of the mark, don't let the attack
+      fall onto the whole mark: also ascend the CE of a whole-logo box, or target the decoy only
+      where the clean box already covers the logo.
+    - Look for a decoy shape that isn't a ghost wordmark (smaller, textured, or at the frame
+      edge). Add a perceptual cost metric (e.g. LPIPS/SSIM in the ring), since PSNR hides the
+      ghost.
+  - **Preset budget:** test grid 1 for medium (it flipped the decoy at ε = 8 on Sintel where
+    grid 2 didn't), and whether `high` (ε = 12) is acceptable visually.
+  - Calibrate the codec proxy. H.264 halved the decoy's wins (8 → 4).
+  - Add and tune the `sam` surrogate (frame chunking first), and tune the ensemble weights.
   - Per-stay universal δ over sampled frames.
-  - A targeted Florence-2 loss (descend towards "no box") if untargeted ascent only moves boxes.
   - Optionally a `blind_remover` surrogate (SLBR) if its licence allows.
   - Hold out MAT/SD inpainting to measure transfer.
 - **Phase 3, service.** Deploy (Modal or self-hosted 5090), latency measurements, a
-  timing-aware strength choice.
+  timing-aware strength choice. Phase 1 timing is ~35 s per 1-frame group and ~67 s per 3-frame
+  group (largest crop, medium), so a multi-stay job needs fewer steps or async jobs.
 - **Phase 4, videotools integration** per §5, behind a toggle, with the `null`
   byte-identical smoke case.
 - **Phase 5, invisible forensic watermark.** Meta VideoSeal or Adobe TrustMark

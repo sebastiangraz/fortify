@@ -25,6 +25,20 @@ test("sends the contract and decodes deltas", async () => {
   expect(out.deltas[0]!.eps).toBe(8);
 });
 
+test("sends the optional view", async () => {
+  let sent: any;
+  const client = createClient({
+    url: "http://x",
+    fetch: fake((_, init) => {
+      sent = JSON.parse(init.body as string);
+      return Response.json({ groups: [{ id: "s0", delta: "gICA", eps: 8, ms: 4 }] });
+    }),
+  });
+  const view = { frame: { w: 1920, h: 1080 }, at: { x: 10, y: 20 }, background: new Uint8Array([1, 2, 255]) };
+  await client.vaccinate({ groups: [{ ...group, view }] });
+  expect(sent.groups[0].view).toEqual({ frame: view.frame, at: view.at, background: "AQL/" });
+});
+
 test("maps failures to typed errors", async () => {
   const rejected = createClient({ url: "http://x", fetch: fake(() => new Response("bad", { status: 400 })) });
   await expect(rejected.vaccinate({ groups: [group] })).rejects.toMatchObject({ code: "rejected", status: 400 });

@@ -12,6 +12,20 @@ export type VaccinateGroup = {
   logo: Rect;
   /** PNG bytes of the watermarked crops; all the same size, at most 8. */
   frames: Uint8Array[];
+  /**
+   * Where the crop sits in the full frame. Optional, but without it detectors that run on
+   * whole frames (Florence-2) are attacked at the wrong scale and the shield misses them.
+   */
+  view?: View;
+};
+
+export type View = {
+  /** Full frame size in pixels. */
+  frame: { w: number; h: number };
+  /** The crop's top-left corner in the frame. */
+  at: { x: number; y: number };
+  /** PNG bytes of the whole frame at any size; a ≤ 1024 px thumbnail is plenty. */
+  background?: Uint8Array;
 };
 
 export type Delta = {
@@ -97,7 +111,12 @@ export function createClient({ url, token, timeoutMs = 120_000, fetch: doFetch =
       const body = JSON.stringify({
         version: 1,
         strength,
-        groups: groups.map((g) => ({ id: g.id, logo: g.logo, frames: g.frames.map(toBase64) })),
+        groups: groups.map((g) => ({
+          id: g.id,
+          logo: g.logo,
+          frames: g.frames.map(toBase64),
+          ...(g.view ? { view: toWireView(g.view) } : {}),
+        })),
       });
       const out = (await call("/v1/vaccinate", { method: "POST", body }, signal)) as {
         offset?: number;
@@ -119,6 +138,10 @@ export function createClient({ url, token, timeoutMs = 120_000, fetch: doFetch =
 }
 
 export type FortifyClient = ReturnType<typeof createClient>;
+
+function toWireView({ frame, at, background }: View) {
+  return { frame, at, ...(background ? { background: toBase64(background) } : {}) };
+}
 
 function toBase64(bytes: Uint8Array): string {
   let text = "";

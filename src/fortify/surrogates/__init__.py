@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from .base import Context, Ensemble, Surrogate
+from .base import Context, Ensemble, Surrogate, View
 
-# name → (factory, default weight). Imports are lazy so a missing optional dep only
-# breaks the surrogate that needs it.
-DEFAULT_WEIGHTS = {"lama": 1.0, "florence2": 0.05, "sam": 0.5}
+# name → default weight: its share of each PGD step (the ensemble balances gradient scales).
+# Imports are lazy so a missing optional dep only breaks the surrogate that needs it.
+DEFAULT_WEIGHTS = {"lama": 1.0, "florence2": 1.0, "sam": 1.0}
 
 
 def make(name: str) -> Surrogate:
@@ -40,4 +40,4 @@ def ensemble(spec: str) -> Ensemble:
     return Ensemble(members)
 
 
-__all__ = ["DEFAULT_WEIGHTS", "Context", "Ensemble", "Surrogate", "ensemble", "make"]
+__all__ = ["DEFAULT_WEIGHTS", "Context", "Ensemble", "Surrogate", "View", "ensemble", "make"]

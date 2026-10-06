@@ -48,12 +48,19 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 def cmd_vaccinate(args: argparse.Namespace) -> int:
     from .attack import apply_delta
     from .imageio import encode_delta, load_png, save_png
-    from .surrogates import ensemble
+    from .surrogates import View, ensemble
     from .vaccinate import Group, vaccinate
 
     frames = torch.cat([load_png(Path(f).read_bytes()) for f in args.frames])
+    view = None
+    if args.view:
+        fw, fh, ax, ay = (int(v) for v in args.view.split(","))
+        bg = load_png(Path(args.background).read_bytes()) if args.background else None
+        view = View((fw, fh), (ax, ay), bg)
     model = ensemble(args.surrogates)
-    r = vaccinate(Group(frames, args.logo, "cli"), model, args.strength, seed=args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    r = vaccinate(Group(frames, args.logo, "cli", view), model, args.strength, seed=args.seed)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "delta.png").write_bytes(encode_delta(r.delta))
@@ -66,6 +73,11 @@ def cmd_vaccinate(args: argparse.Namespace) -> int:
     print(
         f"{args.strength}: {len(args.frames)} frame(s), loss {r.trace[0]:.5f} → {r.trace[-1]:.5f}, {r.ms:.0f} ms → {out}"
     )
+    if r.terms:
+        for name in r.terms[0]:
+            print(f"  {name}: {r.terms[0][name]:.5f} → {r.terms[-1][name]:.5f}")
+    if torch.cuda.is_available():
+        print(f"  peak VRAM {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
     return 0
 
 
@@ -89,6 +101,13 @@ def main(argv: list[str] | None = None) -> int:
         "--frames", nargs="+", required=True, help="PNG crops of the watermarked frames (same size)"
     )
     v.add_argument("--logo", type=_rect, required=True, help="x,y,w,h of the mark inside the crop")
+    v.add_argument(
+        "--view",
+        metavar="W,H,X,Y",
+        help="full frame size and the crop's top-left in it, for surrogates that see whole "
+        "frames (florence2)",
+    )
+    v.add_argument("--background", help="PNG of the whole frame at any size (with --view)")
     v.add_argument("--strength", choices=("low", "medium", "high"), default="medium")
     v.add_argument("--surrogates", default="lama,sam,florence2")
     v.add_argument("--seed", type=int, default=0)

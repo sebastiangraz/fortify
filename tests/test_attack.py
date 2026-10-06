@@ -1,6 +1,14 @@
 import torch
 
-from fortify.attack import AttackConfig, apply_delta, fgsm_config, pgd, rfgsm_config
+from fortify.attack import (
+    AttackConfig,
+    SumLoss,
+    apply_delta,
+    fgsm_config,
+    pgd,
+    rfgsm_config,
+    value_and_grad,
+)
 from fortify.region import Rect, feather
 from fortify.surrogates import Context, ensemble
 from fortify.vaccinate import Group, vaccinate
@@ -72,3 +80,17 @@ def test_feather_ramps_to_border():
     f = feather(10, 20, 4)
     assert float(f[0, 0, 5, 10]) == 1
     assert float(f[0, 0, 0, 0]) < 0.1
+
+
+def test_balanced_sum_gives_each_part_its_weight_share():
+    x = _frames()
+    a = lambda t: (t * t).sum()  # gradient scale ~1
+    b = lambda t: 1000 * t[:, :1].sum()  # gradient scale 1000, one channel only
+    loss = SumLoss([a, b], weights=[1.0, 0.5], names=["a", "b"], balance=True)
+    value, grad = value_and_grad(loss, x)
+    ga, gb = 2 * x, torch.zeros_like(x)
+    gb[:, :1] = 1000
+    want = ga / ga.abs().mean() + 0.5 * gb / gb.abs().mean()
+    assert torch.allclose(grad, want, rtol=1e-4)
+    assert abs(value - float(a(x) + 0.5 * b(x))) < 1e-2 * abs(value)
+    assert set(loss.last) == {"a", "b"}

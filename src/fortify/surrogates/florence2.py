@@ -3,12 +3,30 @@
 This is how WatermarkRemover-AI builds its mask. If the detector stops boxing the logo,
 the inpainter is never told to remove it.
 
-Loss: at bind time, run the real detector on each clean frame and keep the token
-sequence it emits (boxes come out as <loc_*> tokens). The loss is the NEGATIVE
-cross-entropy of that sequence's location tokens, so PGD makes the detector unlikely
-to repeat the boxes. It is capped so one frame can't dominate.
-Untargeted ascent can move a box rather than remove it. If eval shows that, switch to
-a targeted variant (descend towards an empty or far-away answer); see README → Roadmap.
+Loss (targeted, a decoy): at bind time, run the real detector on each clean frame. Its
+answer is a token sequence, `<s>watermark<loc_x0><loc_y0><loc_x1><loc_y1>...</s>`. Every
+box that covers the logo gets its four <loc_*> tokens swapped for a decoy box in the
+context ring beside the logo. The loss is the cross-entropy of that edited answer's
+location tokens, so PGD steers the detector towards boxing the decoy. The remover then
+inpaints a strip of background and leaves the mark.
+- Why not "no box": Florence-2 OVD always answers with a box. On frames without a mark
+  it boxes some other object, so an empty answer is off-distribution.
+- Why not untargeted (ascend the clean answer's CE): tried in Phase 1. It moved boxes
+  rather than removing them, and on one case it grew a box from the "S" symbol to the
+  whole wordmark, which helps the attacker.
+
+View: the real tool runs on the whole frame, shrunk to 768². With a View in the context
+the surrogate builds that picture (background thumbnail, crop pasted at its place)
+so the logo is seen at the attacker's scale, and decoy coordinates are in the
+attacker's frame. Without one it falls back to the crop stretched to 768², which in
+Phase 1 did not transfer to full-frame detection.
+
+Cost: the vision tower (DaViT at 768²) holds ~3.5 GiB of activations per frame for the
+backward, the language model far less. So the vision tower runs once per frame and its
+features are shared by all prompts, frames are batched per prompt, and the loss is a
+SumLoss over chunks of `chunk` frames, so pgd backpropagates one chunk at a time.
+bf16 autocast was tried: no faster on the 5090 at 1-3 frames, and its input gradient
+agreed with fp32 in sign on only ~75% of pixels, so it stays fp32.
 
 Preprocessing is redone in torch so gradients reach the pixels. bind() checks it against
 the real processor and warns on a mismatch.
@@ -23,18 +41,22 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..attack import LossFn
+from ..attack import LossFn, SumLoss
 from ..imageio import to_image
 from ..models import load_florence2, normalize
+from ..region import Rect
 from .base import Context
 
 TASK = "<OPEN_VOCABULARY_DETECTION>"
+BINS = 1000  # Florence-2 quantises box coordinates to 1000 bins per axis
 
 
 @dataclass
 class Florence2Surrogate:
     prompts: tuple[str, ...] = ("watermark", "logo")
-    cap: float = 12.0
+    chunk: int = 2  # frames per backward
+    covers: float = 0.1  # a box "covers" the logo if it overlaps this share of the logo's area
+    gap: int = 16  # px between the (attacker-dilated) logo and the decoy
     name: str = "florence2"
 
     def bind(self, ctx: Context) -> LossFn:
@@ -42,56 +64,164 @@ class Florence2Surrogate:
         model, processor = load_florence2(dev=str(dev))
         side = processor.image_processor.size
         size = (side["height"], side["width"]) if isinstance(side, dict) else (768, 768)
+        cfg = model.config
+        start, pad = cfg.text_config.decoder_start_token_id, cfg.text_config.pad_token_id
+        embed = model.get_input_embeddings()
+        loc_ids = _loc_token_ids(processor.tokenizer).to(dev)
+        pixels, to_bins = _viewer(ctx, size)
 
-        def pixels(x: Tensor) -> Tensor:
-            x = F.interpolate(x, size=size, mode="bicubic", align_corners=False, antialias=True)
-            return normalize(x.clamp(0, 1))
-
-        targets: list[
-            tuple[int, Tensor, Tensor, Tensor]
-        ] = []  # frame, input_ids, labels, loc weight
-        loc_ids = _loc_token_ids(processor.tokenizer)
-        for i in range(ctx.clean.shape[0]):
-            for prompt in self.prompts:
-                inputs = processor(
-                    text=TASK + prompt, images=to_image(ctx.clean[i : i + 1]), return_tensors="pt"
+        if ctx.view is None:
+            ours = pixels(ctx.clean[:1])
+            theirs = processor(images=to_image(ctx.clean[:1]), text=TASK, return_tensors="pt")
+            theirs = theirs["pixel_values"].to(ours)
+            # Mean, not max: bicubic in torch and PIL differ by up to ~0.15 on sharp edges
+            # (mean ~0.001); a wrong size or normalisation shows up as ≫ 0.01.
+            if theirs.shape == ours.shape and (ours - theirs).abs().mean() > 0.01:
+                warnings.warn(
+                    f"florence2 preprocessing drifts from the processor: {(ours - theirs).abs().mean():.3f}"
                 )
-                ours = pixels(ctx.clean[i : i + 1])
-                theirs = inputs["pixel_values"].to(ours)
-                if theirs.shape == ours.shape and (ours - theirs).abs().max() > 0.1:
-                    warnings.warn(
-                        f"florence2 preprocessing drifts from the processor: {(ours - theirs).abs().max():.3f}"
-                    )
-                input_ids = inputs["input_ids"].to(dev)
-                with torch.no_grad():
+
+        logo = to_bins(ctx.logo)
+        decoy = _decoy(ctx, self.gap)
+        if decoy is None:
+            warnings.warn("florence2: no room for a decoy box in the crop's ring; term disabled")
+            return lambda x: x.sum() * 0
+        decoy_ids = loc_ids[torch.tensor(to_bins(decoy), device=dev)]  # all 1000 bins present
+
+        # Per prompt: the text+image-placeholder embedding (same for every frame) and, per
+        # frame, the edited answer to descend towards. Frames where no box covers the logo
+        # (the detector already misses it) keep their own answer, so δ doesn't undo that.
+        prompts: list[tuple[Tensor, Tensor, dict[int, Tensor]]] = []  # embeds, image slots, targets
+        with torch.no_grad():
+            pv = pixels(ctx.clean)
+            for prompt in self.prompts:
+                input_ids = processor(
+                    text=TASK + prompt, images=to_image(ctx.clean[:1]), return_tensors="pt"
+                )["input_ids"].to(dev)
+                targets: dict[int, Tensor] = {}
+                for i in range(ctx.clean.shape[0]):
                     gen = model.generate(
                         input_ids=input_ids,
-                        pixel_values=theirs,
+                        pixel_values=pv[i : i + 1],
                         max_new_tokens=256,
                         num_beams=3,
                         do_sample=False,
                     )
-                labels = gen[:, 1:]  # drop decoder_start; the model shifts labels right itself
-                weight = torch.isin(labels, loc_ids.to(dev)).float()
-                if weight.sum() > 0:  # nothing detected → nothing to suppress for this prompt
-                    targets.append((i, input_ids, labels, weight))
+                    # gen starts with decoder_start; the labels are what follows. Teacher-forced
+                    # on clean, the <loc_*> positions reproduce the generated boxes (checked
+                    # token by token).
+                    labels = gen[0, 1:].clone()
+                    is_loc = torch.isin(labels, loc_ids)
+                    pos = is_loc.nonzero().flatten().tolist()
+                    for k in range(0, len(pos) - 3, 4):
+                        idx = pos[k : k + 4]
+                        box = tuple(int((loc_ids == labels[j]).nonzero()) for j in idx)
+                        if _overlap(box, logo) > self.covers:
+                            labels[idx] = decoy_ids
+                    targets[i] = labels
+                prompts.append((embed(input_ids), input_ids[0] == cfg.image_token_id, targets))
+        frames = list(range(ctx.clean.shape[0]))
+        n_targets = len(frames) * len(prompts)
 
-        def loss(x: Tensor) -> Tensor:
-            if not targets:
-                return x.sum() * 0
-            total = x.new_zeros(())
-            pv = pixels(x)
-            for i, input_ids, labels, weight in targets:
-                logits = model(
-                    input_ids=input_ids, pixel_values=pv[i : i + 1], labels=labels
-                ).logits
-                ce = F.cross_entropy(logits.transpose(1, 2), labels, reduction="none")
-                total = total + ((ce * weight).sum() / weight.sum()).clamp(max=self.cap)
-            return -total / len(targets)
+        def chunk_loss(chunk: list[int]) -> LossFn:
+            # Batch the frames of this chunk per prompt; pad labels at the end (weight 0).
+            batches = []
+            for embeds, slots, targets in prompts:
+                seqs = [targets[i] for i in chunk]
+                labels = torch.full((len(seqs), max(len(s) for s in seqs)), pad, device=dev)
+                for k, s in enumerate(seqs):
+                    labels[k, : len(s)] = s
+                weight = torch.isin(labels, loc_ids).float()
+                decoder_in = torch.cat([torch.full_like(labels[:, :1], start), labels[:, :-1]], 1)
+                batches.append((embeds, slots, labels, weight, decoder_in))
 
-        return loss
+            def loss(x: Tensor) -> Tensor:
+                feats = model.get_image_features(pixels(x[chunk])).pooler_output
+                total = x.new_zeros(())
+                for embeds, slots, labels, weight, decoder_in in batches:
+                    e = embeds.expand(len(chunk), -1, -1).clone()
+                    e[:, slots] = feats
+                    logits = model(inputs_embeds=e, decoder_input_ids=decoder_in).logits
+                    ce = F.cross_entropy(logits.transpose(1, 2), labels, reduction="none")
+                    total = total + ((ce * weight).sum(1) / weight.sum(1).clamp(min=1)).sum()
+                return total / n_targets
+
+            return loss
+
+        return SumLoss(
+            chunk_loss(frames[k : k + self.chunk]) for k in range(0, len(frames), self.chunk)
+        )
+
+
+def _viewer(ctx: Context, size: tuple[int, int]):
+    """(pixels, to_bins): crop batch → the model's normalised input, and crop Rect → loc bins."""
+    h, w = ctx.size
+    resize = lambda x, hw: F.interpolate(
+        x, size=hw, mode="bicubic", align_corners=False, antialias=True
+    )
+    if ctx.view is None:
+
+        def to_bins(r: Rect) -> tuple[int, int, int, int]:
+            x0, y0, x1, y1 = r.xyxy()
+            return _bin(x0 / w), _bin(y0 / h), _bin(x1 / w), _bin(y1 / h)
+
+        return (lambda x: normalize(resize(x, size).clamp(0, 1))), to_bins
+
+    (fw, fh), (ax, ay) = ctx.view.frame, ctx.view.at
+    sy, sx = size[0] / fh, size[1] / fw
+    x0, y0 = round(ax * sx), round(ay * sy)
+    x1, y1 = max(x0 + 1, round((ax + w) * sx)), max(y0 + 1, round((ay + h) * sy))
+    if ctx.view.background is not None:
+        bg = resize(ctx.view.background.to(ctx.clean), size).clamp(0, 1)
+    else:  # unknown surroundings: the crop's mean colour
+        bg = ctx.clean.mean(dim=(0, 2, 3), keepdim=True).expand(1, 3, *size)
+
+    def pixels(x: Tensor) -> Tensor:
+        canvas = bg.expand(x.shape[0], -1, -1, -1).clone()
+        canvas[..., y0:y1, x0:x1] = resize(x, (y1 - y0, x1 - x0)).clamp(0, 1)
+        return normalize(canvas)
+
+    def to_bins(r: Rect) -> tuple[int, int, int, int]:
+        rx0, ry0, rx1, ry1 = r.xyxy()
+        return (
+            _bin((ax + rx0) / fw),
+            _bin((ay + ry0) / fh),
+            _bin((ax + rx1) / fw),
+            _bin((ay + ry1) / fh),
+        )
+
+    return pixels, to_bins
+
+
+def _decoy(ctx: Context, gap: int) -> Rect | None:
+    """The biggest strip of the ring beside the logo, clear of it by `gap` and of the feathered
+    crop border, spanning the logo along the other axis."""
+    h, w = ctx.size
+    lx0, ly0, lx1, ly1 = ctx.logo.xyxy()
+    ring = min(lx0, ly0, w - lx1, h - ly1)
+    m = max(2, ring // 4)  # δ ramps to 0 over the outer quarter of the ring
+    strips = [
+        Rect(lx0, m, lx1 - lx0, ly0 - gap - m),  # above
+        Rect(lx0, ly1 + gap, lx1 - lx0, h - m - ly1 - gap),  # below
+        Rect(m, ly0, lx0 - gap - m, ly1 - ly0),  # left
+        Rect(lx1 + gap, ly0, w - m - lx1 - gap, ly1 - ly0),  # right
+    ]
+    strips = [s for s in strips if s.w >= 4 and s.h >= 4]
+    return max(strips, key=lambda s: s.w * s.h, default=None)
+
+
+def _bin(v: float) -> int:
+    return min(BINS - 1, max(0, int(v * BINS)))
+
+
+def _overlap(box: tuple[int, ...], logo: tuple[int, ...]) -> float:
+    """Share of the logo's area (both in loc bins) that the box covers."""
+    ix = max(0, min(box[2], logo[2]) - max(box[0], logo[0]))
+    iy = max(0, min(box[3], logo[3]) - max(box[1], logo[1]))
+    area = max(1, (logo[2] - logo[0]) * (logo[3] - logo[1]))
+    return ix * iy / area
 
 
 def _loc_token_ids(tokenizer) -> Tensor:
-    ids = [tokenizer.convert_tokens_to_ids(f"<loc_{i}>") for i in range(1000)]
+    ids = [tokenizer.convert_tokens_to_ids(f"<loc_{i}>") for i in range(BINS)]
     return torch.tensor([i for i in ids if i is not None and i != tokenizer.unk_token_id])

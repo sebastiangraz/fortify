@@ -13,14 +13,30 @@ from typing import Protocol
 
 from torch import Tensor
 
-from ..attack import LossFn
+from ..attack import LossFn, SumLoss
 from ..region import Rect, box_mask
+
+
+@dataclass(frozen=True)
+class View:
+    """Where the crop sits in its full frame.
+
+    Some removers run on the whole frame (Florence-2 sees it shrunk to 768²), so the logo
+    reaches them at a different scale, and with different neighbours, than in the crop.
+    A surrogate given a View rebuilds that picture: the background, with the crop
+    pasted in at its place.
+    """
+
+    frame: tuple[int, int]  # (W, H) of the full frame
+    at: tuple[int, int]  # (x, y) of the crop's top-left corner in the frame
+    background: Tensor | None = None  # (1, 3, h, w) the whole frame at any size; None = unknown
 
 
 @dataclass
 class Context:
     clean: Tensor  # (N, 3, H, W) watermarked frames (crop around the mark), in [0, 1]
     logo: Rect  # where the mark sits inside the crop
+    view: View | None = None
 
     @property
     def size(self) -> tuple[int, int]:
@@ -39,7 +55,12 @@ class Surrogate(Protocol):
 
 @dataclass
 class Ensemble:
-    """Weighted sum of surrogate losses. `last` holds each term of the latest call, for logging."""
+    """Weighted sum of surrogate losses. `last` holds each term of the latest call, for logging.
+
+    The bound loss is a balanced SumLoss: pgd backpropagates the surrogates one at a time,
+    and each one's gradient is normalised first, so a weight is that surrogate's share of
+    the step rather than a fudge factor for its loss scale.
+    """
 
     members: Sequence[tuple[Surrogate, float]]
     name: str = "ensemble"
@@ -50,14 +71,11 @@ class Ensemble:
         return all(getattr(s, "zero", False) for s, _ in self.members)
 
     def bind(self, ctx: Context) -> LossFn:
-        bound = [(s.name, s.bind(ctx), w) for s, w in self.members]
-
-        def loss(x: Tensor) -> Tensor:
-            total = x.new_zeros(())
-            for name, fn, weight in bound:
-                term = fn(x)
-                self.last[name] = float(term.detach())
-                total = total + weight * term
-            return total
-
+        loss = SumLoss(
+            [s.bind(ctx) for s, _ in self.members],
+            weights=[w for _, w in self.members],
+            names=[s.name for s, _ in self.members],
+            balance=True,
+        )
+        self.last = loss.last
         return loss

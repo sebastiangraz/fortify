@@ -49,3 +49,13 @@ def test_service_contract(monkeypatch):
         client.post("/v1/vaccinate", json=body, headers={"Authorization": "Bearer t"}).status_code
         == 400
     )
+
+    body["groups"][0]["logo"]["w"] = 40
+    body["groups"][0]["view"] = {"frame": {"w": 320, "h": 180}, "at": {"x": 200, "y": 100}}
+    ok = client.post("/v1/vaccinate", json=body, headers={"Authorization": "Bearer t"})
+    assert ok.status_code == 200, ok.text
+    body["groups"][0]["view"]["at"]["x"] = 300  # crop would stick out of the frame
+    assert (
+        client.post("/v1/vaccinate", json=body, headers={"Authorization": "Bearer t"}).status_code
+        == 400
+    )

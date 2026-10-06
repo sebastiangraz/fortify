@@ -23,7 +23,7 @@ from . import DELTA_OFFSET, __version__
 from .imageio import encode_delta, load_png
 from .models import device
 from .region import Rect
-from .surrogates import ensemble
+from .surrogates import View, ensemble
 from .vaccinate import Group, vaccinate
 
 API_VERSION = 1
@@ -41,10 +41,27 @@ class RectIn(BaseModel):
     h: int = Field(gt=0)
 
 
+class SizeIn(BaseModel):
+    w: int = Field(gt=0)
+    h: int = Field(gt=0)
+
+
+class PointIn(BaseModel):
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+
+
+class ViewIn(BaseModel):
+    frame: SizeIn  # full frame size
+    at: PointIn  # the crop's top-left corner in the frame
+    background: str | None = None  # base64 PNG of the whole frame, any size (a thumbnail)
+
+
 class GroupIn(BaseModel):
     id: str = Field(max_length=64)
     logo: RectIn
     frames: list[str] = Field(min_length=1, max_length=MAX_FRAMES)  # base64 PNG crops
+    view: ViewIn | None = None
 
 
 class VaccinateIn(BaseModel):
@@ -86,11 +103,15 @@ def _auth(authorization: str | None) -> None:
         raise HTTPException(401, "bad token")
 
 
-def _decode(group: GroupIn) -> Group:
+def _png(group: GroupIn, data: str, what: str) -> torch.Tensor:
     try:
-        frames = [load_png(base64.b64decode(f, validate=True)) for f in group.frames]
+        return load_png(base64.b64decode(data, validate=True))
     except (ValueError, OSError) as e:  # bad base64 (binascii.Error) or not an image (PIL)
-        raise HTTPException(400, f"group {group.id}: unreadable frame ({e})") from None
+        raise HTTPException(400, f"group {group.id}: unreadable {what} ({e})") from None
+
+
+def _decode(group: GroupIn) -> Group:
+    frames = [_png(group, f, "frame") for f in group.frames]
     sizes = {tuple(f.shape[-2:]) for f in frames}
     if len(sizes) != 1:
         raise HTTPException(400, f"group {group.id}: frames differ in size {sizes}")
@@ -100,7 +121,21 @@ def _decode(group: GroupIn) -> Group:
     logo = Rect(**group.logo.model_dump())
     if logo.x + logo.w > w or logo.y + logo.h > h:
         raise HTTPException(400, f"group {group.id}: logo rect is outside the {w}x{h} crop")
-    return Group(torch.cat(frames), logo, group.id)
+    return Group(torch.cat(frames), logo, group.id, _view(group, w, h))
+
+
+def _view(group: GroupIn, w: int, h: int) -> View | None:
+    v = group.view
+    if v is None:
+        return None
+    if v.at.x + w > v.frame.w or v.at.y + h > v.frame.h:
+        raise HTTPException(400, f"group {group.id}: the crop is outside the view's frame")
+    bg = None
+    if v.background is not None:
+        bg = _png(group, v.background, "view background")
+        if bg.shape[-2] * bg.shape[-1] > MAX_PIXELS:
+            raise HTTPException(413, f"group {group.id}: view background is over {MAX_PIXELS} px")
+    return View((v.frame.w, v.frame.h), (v.at.x, v.at.y), bg)
 
 
 @app.get("/health")

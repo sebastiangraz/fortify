@@ -13,7 +13,7 @@ from .attack import AttackConfig, pgd, rfgsm_config
 from .eot import CodecProxy
 from .models import device
 from .region import Rect, feather
-from .surrogates import Context, Surrogate
+from .surrogates import Context, Surrogate, View
 
 Strength = Literal["low", "medium", "high"]
 
@@ -48,6 +48,7 @@ class Group:
     frames: Tensor  # (N, 3, H, W) crops of the watermarked frames, all the same rect
     logo: Rect  # mark position inside the crop
     id: str = ""
+    view: View | None = None  # where the crop sits in the full frame, if the consumer says
 
 
 @dataclass
@@ -56,7 +57,8 @@ class Result:
     delta: Tensor  # (1, 3, H, W), on whole 8-bit levels, |δ| ≤ eps
     eps: float
     ms: float
-    trace: list[float] = field(default_factory=list)
+    trace: list[float] = field(default_factory=list)  # total loss per step
+    terms: list[dict[str, float]] = field(default_factory=list)  # per surrogate, per step
 
 
 def vaccinate(
@@ -77,15 +79,18 @@ def vaccinate(
 
     if getattr(surrogate, "zero", False):  # the null surrogate: δ ≡ 0, skip the noise start too
         return Result(group.id, torch.zeros((1, 3, h, w)), preset.attack.eps, 0.0)
-    loss_fn = surrogate.bind(Context(clean=x, logo=logo))
+    loss_fn = surrogate.bind(Context(clean=x, logo=logo, view=group.view))
     transform = CodecProxy(seed=seed) if preset.eot else None
     trace: list[float] = []
+    terms: list[dict[str, float]] = []
+
+    def on_step(_: int, value: float) -> None:
+        trace.append(value)
+        terms.append(dict(getattr(surrogate, "last", {})))
+
     gen = torch.Generator(device=x.device).manual_seed(seed)
-    delta = pgd(
-        x, loss_fn, region, preset.attack, transform, gen, on_step=lambda _, v: trace.append(v)
-    )
+    delta = pgd(x, loss_fn, region, preset.attack, transform, gen, on_step=on_step)
     if x.is_cuda:
         torch.cuda.synchronize()
-    return Result(
-        group.id, delta.cpu(), preset.attack.eps, (time.perf_counter() - start) * 1000, trace
-    )
+    ms = (time.perf_counter() - start) * 1000
+    return Result(group.id, delta.cpu(), preset.attack.eps, ms, trace, terms)

@@ -10,7 +10,7 @@ Conventions (shared by every module):
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import torch
@@ -31,6 +31,58 @@ class AttackConfig:
     # Start from uniform noise in ±random_start·eps. Needed for "disrupting" losses
     # (distance to the clean output), whose gradient is exactly 0 at δ = 0.
     random_start: float = 0.0
+
+
+class SumLoss:
+    """A weighted sum of named parts, e.g. one per surrogate.
+
+    pgd backpropagates each part on its own (value_and_grad), so peak memory is the largest
+    part's graph instead of all of them at once. With `balance`, each part's gradient is
+    scaled to unit mean |g| before weighting, so the weights set each part's share of the
+    step whatever its loss scale (LaMa MSE ~0.01 vs Florence-2 CE ~10 vs SAM ClipMSE ~100).
+    """
+
+    def __init__(
+        self,
+        parts: Iterable[LossFn],
+        weights: Iterable[float] | None = None,
+        names: Iterable[str] | None = None,
+        balance: bool = False,
+    ):
+        self.parts = list(parts)
+        self.weights = list(weights) if weights is not None else [1.0] * len(self.parts)
+        self.names = list(names) if names is not None else [str(i) for i in range(len(self.parts))]
+        self.balance = balance
+        self.last: dict[str, float] = {}  # each part's value at the latest call, for logging
+
+    def __call__(self, x: Tensor) -> Tensor:
+        total = x.new_zeros(())
+        for name, weight, part in zip(self.names, self.weights, self.parts):
+            term = part(x)
+            self.last[name] = float(term.detach())
+            total = total + weight * term
+        return total
+
+
+def value_and_grad(loss_fn: LossFn, x: Tensor) -> tuple[float, Tensor]:
+    """The loss at x and its gradient with respect to x, one SumLoss part at a time."""
+    return _value_and_grad(loss_fn, x.detach().requires_grad_(True))
+
+
+def _value_and_grad(fn: LossFn, leaf: Tensor) -> tuple[float, Tensor]:
+    if not isinstance(fn, SumLoss):
+        v = fn(leaf)
+        g = torch.autograd.grad(v, leaf)[0] if v.requires_grad else torch.zeros_like(leaf)
+        return float(v.detach()), g
+    value, grad = 0.0, torch.zeros_like(leaf)
+    for name, weight, part in zip(fn.names, fn.weights, fn.parts):
+        v, g = _value_and_grad(part, leaf)
+        fn.last[name] = v
+        if fn.balance:
+            g = g / g.abs().mean().clamp(min=1e-12)
+        value += weight * v
+        grad += weight * g
+    return value, grad
 
 
 def fgsm_config(eps: float) -> AttackConfig:
@@ -84,19 +136,20 @@ def pgd(
 
     for step in range(cfg.steps):
         theta.requires_grad_(True)
-        delta = upsample(theta, (h, w)) * region
-        total = x.new_zeros(())
+        grad, total = torch.zeros_like(theta), 0.0
+        # One backward per EOT sample (and per SumLoss part), accumulated: memory stays at
+        # one sample's graph however many samples, frames or surrogates there are.
         for _ in range(cfg.eot_samples):
-            adv = (x + delta).clamp(0, 1)
+            adv = (x + upsample(theta, (h, w)) * region).clamp(0, 1)
             if transform is not None:
                 adv = transform(adv)
-            total = total + loss_fn(adv)
-        total = total / cfg.eot_samples
-        (grad,) = torch.autograd.grad(total, theta)
+            value, g = value_and_grad(loss_fn, adv)
+            grad += torch.autograd.grad(adv, theta, g)[0]
+            total += value / cfg.eot_samples
         with torch.no_grad():
             theta = (theta - cfg.alpha * grad.sign()).clamp(-cfg.eps, cfg.eps)
         if on_step is not None:
-            on_step(step, float(total.detach()))
+            on_step(step, total)
 
     with torch.no_grad():
         delta = upsample(theta.detach(), (h, w)) * region

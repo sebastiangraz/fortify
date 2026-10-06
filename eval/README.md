@@ -42,7 +42,13 @@ backgrounds (sky, grass, faces, text); a few positions. Names are `<clip>-<filte
 uv run python eval/run.py --data eval/data --codec h264:23                    # Phase 0 baseline
 uv run python eval/run.py --data eval/data --codec h264:23 --shield medium    # with fortify
 uv run python eval/run.py --codec jpeg:75 --removers oracle-lama              # quick loop
+uv run python eval/run.py --shield medium --codec h264:23,none --cases 'sintel*'  # one δ, two codecs
 ```
+
+- Each δ is computed once per case and scored under every codec in the `--codec` list.
+- Shielding passes surrogates a View: the frame size, the crop's place in it, and a
+  1024 px thumbnail of the marked frame, as a consumer would send. `--no-view` turns it off.
+- Rows carry `loss_<surrogate>`, each surrogate's loss at the last PGD step.
 
 `--codec` is applied *before* removal. It stands for what the attacker downloads (our
 encode, maybe re-encoded by a platform). `h264:<crf>` uses real x264 and needs ffmpeg:
@@ -67,6 +73,11 @@ Read the two scores together, and look at the images:
   that wipes the mark completely still misses clean pixel for pixel by about as much as the mark
   itself, so the score lands near 0–0.5. Phase 0 had a desert case at 0.23 with the mark visibly gone.
 - **`mark_residual` ignores error that has nothing to do with the mark**, so it reads ≈ 0 there.
+- **A broken fill on a shielded frame** (the `lama` term's goal) shows up as a large negative
+  `removal_score` and a low `removed_psnr_logo`. On plain marks `removal_score` can still read
+  0.8 there, because the white logo makes the baseline error huge. Read `removed_psnr_logo`, or
+  the images. `mark_residual` is meaningless for broken fills (values of −2 or +1.7 just mean
+  "far from clean").
 - **`mark_residual` over-reads blur marks over sharp texture.** The blur mark *is* (blurred
   − sharp) in the logo's shape, and any smooth fill correlates with that. Values ≈ 1 or above on
   `kodim08`/`kodim15` blur came from fills where no logo shape is left. Check the restored PNGs
