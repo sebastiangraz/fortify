@@ -11,6 +11,48 @@ filters, layout or encoders.
 > client and eval harness are written. What has been run so far is in
 > [Status](#status). Phases 0 (baseline red-team) and 1 (single-frame shield) are done.
 > **Phase 2** (robustness) is partly done; what's left is in [Roadmap](#roadmap).
+> Start with [Learnings](#learnings-if-we-started-over): what Phases 0–2 taught us, written for a fresh start.
+
+## Learnings (if we started over)
+
+What works:
+- Off-the-shelf removers take an unprotected Mark off almost every time: a hand-drawn box with LaMa or MAT removed 21–24 of 24 marks.
+- Rotating the mark between positions defeats "prompt SAM2 once and propagate" video tools, because the tracker loses the mark at the first jump.
+- Steering Florence-2 to box a decoy strip beside the logo works: after x264 CRF 23 it missed the logo on 10 of 24 frames, with no box moving onto the logo.
+- The decoy has to be the target because Florence-2 always answers with some box, even on frames without a mark, so "no box" is off-distribution.
+- Florence-2 must be attacked in the attacker's whole-frame view (the crop pasted into a frame thumbnail), since a δ tuned on the crop alone did nothing to full-frame detection.
+- Disrupting LaMa works against exactly the mask it was trained on: the 8 px box got visibly broken fills (5–10 dB in the logo) that survive H.264.
+- PGD with momentum (μ = 0.9) was the biggest single gain in surviving H.264.
+- Each surrogate's gradient must be normalised before weighting, or the loss with the largest scale silences the others.
+- Backpropagating per EOT sample, per surrogate and per 2-frame chunk keeps any group under ~15 GiB on a 32 GB card (Florence-2 alone used to need 34 GiB and 41 s per step).
+- A low-frequency δ (optimised on a half-resolution grid) beats a full-resolution one on both codec survival and visibility.
+
+What doesn't work:
+- Glass refraction, blur marks and harder compression (CRF 28 vs 23) gave no real protection on their own.
+- Untargeted attacks on a detector move its boxes instead of removing them, and once made Florence-2 box the whole logo instead of only the "S".
+- The LaMa disruption sits right at the hole's edge, so a mask 4 px off, a SAM-shaped mask or a hand-drawn mask gets a clean fill.
+- Training LaMa on several nearby masks (4, 8 and 16 px plus SAM) breaks none of them, because they compete for the same edge pixels.
+- No setup broke a box dilated 40 px, and fills inside SAM masks were never broken.
+- bf16 autocast for Florence-2 was no faster, and its gradient signs matched fp32 on only ~75% of pixels.
+- PSNR is the wrong cost metric: at ~45 dB the decoy still paints a visible ghost wordmark on flat or dark backgrounds (ring SSIM 0.78–0.90).
+- The original `microsoft/Florence-2-*` remote code crashes on transformers 5, so use the native `florence-community` port.
+- SLBR has no licence and ProPainter is non-commercial, so neither can ship as a surrogate.
+
+What could work:
+- Matching the real tools' exact masks could make the LaMa term hit one-click tools: WatermarkRemover-AI inpaints Florence-2's box undilated, and IOPaint dilates SAM's mask by ~4 px.
+- A smaller, textured or frame-edge decoy, or an SSIM term in the loss, could remove the ghost.
+- Real delivery may be kinder than our eval: a whole clip at CRF 23 keeps about twice as much of a static δ as a lone frame.
+- Mark design (large marks over textured, salient content, plus rotation) raises removal cost without entering an adversarial arms race.
+- An invisible forensic watermark (VideoSeal or TrustMark) is the only protection that still pays off after a successful removal.
+
+What to try next:
+- Before building more, run a kill test: shielded frames against an adaptive attacker (mask dilation 16, 24 and 40 px, a 0.75× resize, blur σ = 1, JPEG 60, MAT, SD and ProPainter).
+- Expect an arms race either way, since Glaze, Mist and PhotoGuard-style protections all fell to simple preprocessing, and nothing here suggests watermark shields will do better.
+- Frame the goal as friction against one-click tools plus proof of ownership, not as a removal blocker.
+- Build the eval first, on whole clips, with the real tools' masks, held-out removers and a perceptual cost metric (SSIM or LPIPS) from day one.
+- Aim the shield at the detector stage, where the decoy measurably works, and treat inpainter disruption as best effort.
+- Start the forensic watermark early, as a parallel track.
+- Budget for time: ~30–70 s per group at medium on a 5090 means multi-stay videos need async jobs or a cheaper preset.
 
 ---
 
