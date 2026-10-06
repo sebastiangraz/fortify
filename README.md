@@ -419,11 +419,11 @@ What has actually been run is recorded here. Keep it current.
       384×256 crop with a 160×80 "WATERMARK" box, 2 frames, ε = 8, 10 PGD steps,
       2 EOT samples with the codec proxy. Each surrogate ran in its own process.
 
-      | surrogate | result | ms / step | peak VRAM |
-      |---|---|---|---|
-      | `lama` | fill MSE in the hole 0 → 0.020 (≈ 36/255 RMS), so the fill is pushed well off the clean plate | ~350 | 4.1 GiB |
-      | `sam` (sam2.1-hiera-large) | ClipMSE 70 → 33; no preprocessing-drift warning, so stretch/pad detection matched | ~750 | 24.5 GiB |
-      | `florence2` (florence-community/Florence-2-large) | detected the box on clean; loc-token CE 0.95 → 3.77 | **~41 000** | **34.3 GiB**, over the 32 GB card, spilling to shared memory |
+  | surrogate | result | ms / step | peak VRAM |
+  |---|---|---|---|
+  | `lama` | fill MSE in the hole 0 → 0.020 (≈ 36/255 RMS), so the fill is pushed well off the clean plate | ~350 | 4.1 GiB |
+  | `sam` (sam2.1-hiera-large) | ClipMSE 70 → 33; no preprocessing-drift warning, so stretch/pad detection matched | ~750 | 24.5 GiB |
+  | `florence2` (florence-community/Florence-2-large) | detected the box on clean; loc-token CE 0.95 → 3.77 | **~41 000** | **34.3 GiB**, over the 32 GB card, spilling to shared memory |
 - [x] **Phase 0 baseline red-team (2026-10-06).** Results are in
       [Phase 0 results](#phase-0-results-2026-10-06) below.
 - [x] **Phase 1 single-frame shield, `lama` + `florence2` (2026-10-06).** Results are in
