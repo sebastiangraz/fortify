@@ -5,6 +5,8 @@ to know it, e.g. by drawing the mask by hand). It returns (restored frame, info)
 info carries detector-side numbers.
 
 - oracle-lama:   attacker draws the mask by hand (dilated box) → LaMa. Worst case for us.
+- loose-lama:    the same with a sloppier box (dilated 24 px). Held out: the lama
+                 surrogate trains on boxes dilated 4/8/16 and a SAM mask, never on this one.
 - florence-lama: Florence-2 OVD "watermark" → boxes → LaMa. The WatermarkRemover-AI pipeline.
 - sam-lama:      attacker drags a box → SAM mask (dilated) → LaMa. IOPaint-style.
 
@@ -30,10 +32,14 @@ def _dilate(mask: Tensor, px: int) -> Tensor:
 
 
 @torch.no_grad()
-def oracle_lama(x: Tensor, logo: Rect) -> tuple[Tensor, dict]:
+def oracle_lama(x: Tensor, logo: Rect, dilate: int = DILATE) -> tuple[Tensor, dict]:
     h, w = x.shape[-2:]
-    mask = box_mask(logo, h, w, DILATE).to(x)
+    mask = box_mask(logo, h, w, dilate).to(x)
     return lama_inpaint(load_lama(str(x.device)), x, mask), {}
+
+
+def loose_lama(x: Tensor, logo: Rect) -> tuple[Tensor, dict]:
+    return oracle_lama(x, logo, dilate=24)
 
 
 @torch.no_grad()
@@ -81,4 +87,9 @@ def _covered(mask: Tensor, logo: Rect) -> float:
     return float(mask[..., y0:y1, x0:x1].mean())
 
 
-REMOVERS = {"oracle-lama": oracle_lama, "florence-lama": florence_lama, "sam-lama": sam_lama}
+REMOVERS = {
+    "oracle-lama": oracle_lama,
+    "loose-lama": loose_lama,
+    "florence-lama": florence_lama,
+    "sam-lama": sam_lama,
+}

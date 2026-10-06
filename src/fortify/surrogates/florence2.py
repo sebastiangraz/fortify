@@ -5,7 +5,7 @@ the inpainter is never told to remove it.
 
 Loss (targeted, a decoy): at bind time, run the real detector on each clean frame. Its
 answer is a token sequence, `<s>watermark<loc_x0><loc_y0><loc_x1><loc_y1>...</s>`. Every
-box that covers the logo gets its four <loc_*> tokens swapped for a decoy box in the
+box that covers most of the logo gets its four <loc_*> tokens swapped for a decoy box in the
 context ring beside the logo. The loss is the cross-entropy of that edited answer's
 location tokens, so PGD steers the detector towards boxing the decoy. The remover then
 inpaints a strip of background and leaves the mark.
@@ -14,6 +14,13 @@ inpaints a strip of background and leaves the mark.
 - Why not untargeted (ascend the clean answer's CE): tried in Phase 1. It moved boxes
   rather than removing them, and on one case it grew a box from the "S" symbol to the
   whole wordmark, which helps the attacker.
+- Partial boxes are kept, not decoyed. On large wordmarks the clean detector often boxes
+  only the symbol (coverage ~0.25). Swapping that box for the decoy made the detector
+  find the whole mark on three Phase 1 cases. So only boxes that cover at least `whole` of
+  the logo get the decoy; a partial box stays the target, which holds the miss.
+- And a hinge on the whole-logo answer: the same answer with its logo box (or its first
+  box) set to the whole logo. Its CE may rise but never drop below its clean value, so no
+  frame's δ makes "box the whole mark" likelier than it was.
 
 View: the real tool runs on the whole frame, shrunk to 768². With a View in the context
 the surrogate builds that picture (background thumbnail, crop pasted at its place)
@@ -56,6 +63,7 @@ class Florence2Surrogate:
     prompts: tuple[str, ...] = ("watermark", "logo")
     chunk: int = 2  # frames per backward
     covers: float = 0.1  # a box "covers" the logo if it overlaps this share of the logo's area
+    whole: float = 0.5  # ...and only boxes covering this share are swapped for the decoy
     gap: int = 16  # px between the (attacker-dilated) logo and the decoy
     name: str = "florence2"
 
@@ -87,18 +95,36 @@ class Florence2Surrogate:
             warnings.warn("florence2: no room for a decoy box in the crop's ring; term disabled")
             return lambda x: x.sum() * 0
         decoy_ids = loc_ids[torch.tensor(to_bins(decoy), device=dev)]  # all 1000 bins present
+        logo_ids = loc_ids[torch.tensor(logo, device=dev)]
+
+        def loc_ce(feats: Tensor, embeds: Tensor, slots: Tensor, seqs: list[Tensor]) -> Tensor:
+            """Mean CE of each answer's <loc_*> tokens, teacher-forced on feats[k] for seqs[k]."""
+            labels = torch.full((len(seqs), max(len(s) for s in seqs)), pad, device=dev)
+            for k, s in enumerate(seqs):
+                labels[k, : len(s)] = s
+            weight = torch.isin(labels, loc_ids).float()  # pad and text tokens weigh 0
+            decoder_in = torch.cat([torch.full_like(labels[:, :1], start), labels[:, :-1]], 1)
+            e = embeds.expand(len(seqs), -1, -1).clone()
+            e[:, slots] = feats
+            logits = model(inputs_embeds=e, decoder_input_ids=decoder_in).logits
+            ce = F.cross_entropy(logits.transpose(1, 2), labels, reduction="none")
+            return (ce * weight).sum(1) / weight.sum(1).clamp(min=1)
 
         # Per prompt: the text+image-placeholder embedding (same for every frame) and, per
-        # frame, the edited answer to descend towards. Frames where no box covers the logo
-        # (the detector already misses it) keep their own answer, so δ doesn't undo that.
-        prompts: list[tuple[Tensor, Tensor, dict[int, Tensor]]] = []  # embeds, image slots, targets
+        # frame, the edited answer to descend towards plus the whole-logo answer to hold off.
+        # Frames where no box covers the logo (the detector already misses it), or only part
+        # of it, keep their own answer, so δ doesn't undo that.
+        prompts = []  # (embeds, image slots, {frame: target}, {frame: whole}, {frame: whole CE})
         with torch.no_grad():
             pv = pixels(ctx.clean)
+            feats_clean = model.get_image_features(pv).pooler_output
             for prompt in self.prompts:
                 input_ids = processor(
                     text=TASK + prompt, images=to_image(ctx.clean[:1]), return_tensors="pt"
                 )["input_ids"].to(dev)
+                embeds, slots = embed(input_ids), input_ids[0] == cfg.image_token_id
                 targets: dict[int, Tensor] = {}
+                wholes: dict[int, Tensor] = {}
                 for i in range(ctx.clean.shape[0]):
                     gen = model.generate(
                         input_ids=input_ids,
@@ -111,39 +137,43 @@ class Florence2Surrogate:
                     # on clean, the <loc_*> positions reproduce the generated boxes (checked
                     # token by token).
                     labels = gen[0, 1:].clone()
-                    is_loc = torch.isin(labels, loc_ids)
-                    pos = is_loc.nonzero().flatten().tolist()
-                    for k in range(0, len(pos) - 3, 4):
-                        idx = pos[k : k + 4]
+                    whole = labels.clone()
+                    pos = torch.isin(labels, loc_ids).nonzero().flatten().tolist()
+                    boxes = [pos[k : k + 4] for k in range(0, len(pos) - 3, 4)]
+                    on_logo = None
+                    for idx in boxes:
                         box = tuple(int((loc_ids == labels[j]).nonzero()) for j in idx)
-                        if _overlap(box, logo) > self.covers:
+                        cover = _overlap(box, logo)
+                        if cover > self.covers and on_logo is None:
+                            on_logo = idx
+                        if cover >= self.whole:
                             labels[idx] = decoy_ids
+                    if boxes:
+                        whole[on_logo or boxes[0]] = logo_ids
+                        wholes[i] = whole
                     targets[i] = labels
-                prompts.append((embed(input_ids), input_ids[0] == cfg.image_token_id, targets))
+                floor = {
+                    i: float(loc_ce(feats_clean[i : i + 1], embeds, slots, [s])[0])
+                    for i, s in wholes.items()
+                }
+                prompts.append((embeds, slots, targets, wholes, floor))
         frames = list(range(ctx.clean.shape[0]))
         n_targets = len(frames) * len(prompts)
 
         def chunk_loss(chunk: list[int]) -> LossFn:
-            # Batch the frames of this chunk per prompt; pad labels at the end (weight 0).
-            batches = []
-            for embeds, slots, targets in prompts:
-                seqs = [targets[i] for i in chunk]
-                labels = torch.full((len(seqs), max(len(s) for s in seqs)), pad, device=dev)
-                for k, s in enumerate(seqs):
-                    labels[k, : len(s)] = s
-                weight = torch.isin(labels, loc_ids).float()
-                decoder_in = torch.cat([torch.full_like(labels[:, :1], start), labels[:, :-1]], 1)
-                batches.append((embeds, slots, labels, weight, decoder_in))
-
             def loss(x: Tensor) -> Tensor:
                 feats = model.get_image_features(pixels(x[chunk])).pooler_output
                 total = x.new_zeros(())
-                for embeds, slots, labels, weight, decoder_in in batches:
-                    e = embeds.expand(len(chunk), -1, -1).clone()
-                    e[:, slots] = feats
-                    logits = model(inputs_embeds=e, decoder_input_ids=decoder_in).logits
-                    ce = F.cross_entropy(logits.transpose(1, 2), labels, reduction="none")
-                    total = total + ((ce * weight).sum(1) / weight.sum(1).clamp(min=1)).sum()
+                for embeds, slots, targets, wholes, floor in prompts:
+                    # One LM pass scores both answers: every frame's target, then the
+                    # whole-logo answer of each frame that has one.
+                    held = [i for i in chunk if i in wholes]
+                    rows = list(range(len(chunk))) + [chunk.index(i) for i in held]
+                    seqs = [targets[i] for i in chunk] + [wholes[i] for i in held]
+                    ce = loc_ce(feats[rows], embeds, slots, seqs)
+                    target_ce, whole_ce = ce[: len(chunk)], ce[len(chunk) :]
+                    floors = torch.tensor([floor[i] for i in held], device=dev)
+                    total = total + target_ce.sum() + F.relu(floors - whole_ce).sum()
                 return total / n_targets
 
             return loss

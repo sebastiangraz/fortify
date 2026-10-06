@@ -31,6 +31,11 @@ class AttackConfig:
     # Start from uniform noise in ±random_start·eps. Needed for "disrupting" losses
     # (distance to the clean output), whose gradient is exactly 0 at δ = 0.
     random_start: float = 0.0
+    # MI-FGSM (Dong et al. 2018): step on the sign of a running sum of L1-normalised
+    # gradients, decayed by this factor. When each step sees a different EOT draw (a codec,
+    # an attacker mask), plain sign steps chase the latest draw and oscillate; momentum
+    # steps towards what most draws agree on. 0 = plain PGD.
+    momentum: float = 0.0
 
 
 class SumLoss:
@@ -134,6 +139,7 @@ def pgd(
     else:
         theta = torch.zeros((1, 3, gh, gw), device=x.device, dtype=x.dtype)
 
+    velocity = torch.zeros_like(theta)
     for step in range(cfg.steps):
         theta.requires_grad_(True)
         grad, total = torch.zeros_like(theta), 0.0
@@ -147,6 +153,9 @@ def pgd(
             grad += torch.autograd.grad(adv, theta, g)[0]
             total += value / cfg.eot_samples
         with torch.no_grad():
+            if cfg.momentum:
+                velocity = cfg.momentum * velocity + grad / grad.abs().mean().clamp(min=1e-12)
+                grad = velocity
             theta = (theta - cfg.alpha * grad.sign()).clamp(-cfg.eps, cfg.eps)
         if on_step is not None:
             on_step(step, total)

@@ -94,3 +94,34 @@ def test_balanced_sum_gives_each_part_its_weight_share():
     assert torch.allclose(grad, want, rtol=1e-4)
     assert abs(value - float(a(x) + 0.5 * b(x))) < 1e-2 * abs(value)
     assert set(loss.last) == {"a", "b"}
+
+
+def test_tune_overrides_the_preset():
+    r = vaccinate(
+        Group(_frames(), Rect(32, 20, 32, 24)), ensemble("toy"), "high", tune={"eps": 2 / 255}
+    )
+    assert r.eps == 2 / 255
+    assert float(r.delta.abs().max()) <= 2 / 255 + 1e-6
+
+
+def test_lama_cycles_through_its_mask_bank(monkeypatch):
+    # LaMa itself is stubbed: what matters is that every chunk sees every mask in turn.
+    from fortify.surrogates import lama
+
+    seen = []
+
+    def inpaint(model, image, mask):
+        seen.append(int(mask.sum()))
+        return image * (1 - mask) + 0.5 * mask
+
+    monkeypatch.setattr(lama, "load_lama", lambda dev: None)
+    monkeypatch.setattr(lama, "lama_inpaint", inpaint)
+    x = _frames(n=3)
+    s = lama.LamaSurrogate(masks=("box:2", "box:6"), chunk=2)
+    loss = s.bind(Context(x, Rect(32, 20, 32, 24)))
+    seen.clear()
+    for _ in range(2):
+        value_and_grad(loss, x)
+    small, big = sorted(set(seen))
+    # 2 chunks (frames 0-1 and 2) × 2 calls; each chunk alternates small, big.
+    assert seen == [small, small, big, big]

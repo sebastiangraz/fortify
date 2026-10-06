@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 import torch
@@ -25,18 +25,31 @@ class Preset:
 
 
 # ε are whole 8-bit levels, so the quantized δ never exceeds them. All presets start
-# from noise: the lama loss has zero gradient at δ = 0 (see attack.AttackConfig).
+# from noise: the lama loss has zero gradient at δ = 0 (see attack.AttackConfig). The PGD
+# presets use momentum: lama cycles through attacker masks, and without it the steps oscillate.
 PRESETS: dict[Strength, Preset] = {
     "low": Preset(rfgsm_config(4 / 255), eot=False),
     "medium": Preset(
         AttackConfig(
-            eps=8 / 255, alpha=1.5 / 255, steps=50, eot_samples=2, grid=2, random_start=0.25
+            eps=8 / 255,
+            alpha=1.5 / 255,
+            steps=50,
+            eot_samples=2,
+            grid=2,
+            random_start=0.25,
+            momentum=0.9,
         ),
         eot=True,
     ),
     "high": Preset(
         AttackConfig(
-            eps=12 / 255, alpha=1.5 / 255, steps=100, eot_samples=4, grid=2, random_start=0.25
+            eps=12 / 255,
+            alpha=1.5 / 255,
+            steps=100,
+            eot_samples=4,
+            grid=2,
+            random_start=0.25,
+            momentum=0.9,
         ),
         eot=True,
     ),
@@ -67,8 +80,12 @@ def vaccinate(
     strength: Strength = "medium",
     feather_px: int | None = None,
     seed: int = 0,
+    tune: dict | None = None,
 ) -> Result:
+    """tune: AttackConfig fields to override on the preset, for budget experiments
+    (e.g. {"grid": 1}). The service never passes it."""
     preset = PRESETS[strength]
+    cfg = replace(preset.attack, **tune) if tune else preset.attack
     start = time.perf_counter()
     x = group.frames.to(device())
     _, _, h, w = x.shape
@@ -78,7 +95,7 @@ def vaccinate(
     region = feather(h, w, feather_px if feather_px is not None else max(0, ring // 4)).to(x)
 
     if getattr(surrogate, "zero", False):  # the null surrogate: δ ≡ 0, skip the noise start too
-        return Result(group.id, torch.zeros((1, 3, h, w)), preset.attack.eps, 0.0)
+        return Result(group.id, torch.zeros((1, 3, h, w)), cfg.eps, 0.0)
     loss_fn = surrogate.bind(Context(clean=x, logo=logo, view=group.view))
     transform = CodecProxy(seed=seed) if preset.eot else None
     trace: list[float] = []
@@ -89,8 +106,8 @@ def vaccinate(
         terms.append(dict(getattr(surrogate, "last", {})))
 
     gen = torch.Generator(device=x.device).manual_seed(seed)
-    delta = pgd(x, loss_fn, region, preset.attack, transform, gen, on_step=on_step)
+    delta = pgd(x, loss_fn, region, cfg, transform, gen, on_step=on_step)
     if x.is_cuda:
         torch.cuda.synchronize()
     ms = (time.perf_counter() - start) * 1000
-    return Result(group.id, delta.cpu(), preset.attack.eps, ms, trace, terms)
+    return Result(group.id, delta.cpu(), cfg.eps, ms, trace, terms)

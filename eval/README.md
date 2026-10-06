@@ -43,12 +43,23 @@ uv run python eval/run.py --data eval/data --codec h264:23                    # 
 uv run python eval/run.py --data eval/data --codec h264:23 --shield medium    # with fortify
 uv run python eval/run.py --codec jpeg:75 --removers oracle-lama              # quick loop
 uv run python eval/run.py --shield medium --codec h264:23,none --cases 'sintel*'  # one δ, two codecs
+uv run python eval/run.py --shield medium --tune grid=1 --cases 'sintel03*,kodim05*'  # budget test
+uv run python eval/summary.py runs/p1-medium runs/p2-medium     # the README's tables, per run
 ```
 
 - Each δ is computed once per case and scored under every codec in the `--codec` list.
 - Shielding passes surrogates a View: the frame size, the crop's place in it, and a
   1024 px thumbnail of the marked frame, as a consumer would send. `--no-view` turns it off.
 - Rows carry `loss_<surrogate>`, each surrogate's loss at the last PGD step.
+- `--tune` overrides preset fields for budget experiments (`eps`/`alpha` in 8-bit levels).
+  The service never does this.
+- `--cases` takes comma-separated globs (`fnmatch`, so no `{a,b}` braces).
+- `summary.py` counts removals (`removal_score` > 0.5) and mask moves per remover and codec,
+  and the shield's cost, the way the README's tables do.
+- **Single-frame `h264:<crf>` is harsher than delivery.** One frame encoded alone is an
+  I-frame. Inside a clip, P/B-frames predict a static δ from the frame before and keep about
+  twice as much of it at CRF 23 (see "Calibrating the codec proxy"). Eval numbers under
+  `h264:23` are a pessimistic bound.
 
 `--codec` is applied *before* removal. It stands for what the attacker downloads (our
 encode, maybe re-encoded by a platform). `h264:<crf>` uses real x264 and needs ffmpeg:
@@ -64,6 +75,7 @@ set `FFMPEG` to videotools' `api/_bin/ffmpeg/win32-x64/ffmpeg.exe`.
 | `logo_covered` | share of the logo rect the remover's mask covers (detection stages) | low |
 | `boxes` / `mask_px` | detector output size | 0 / small |
 | `shield_cost_psnr` | PSNR of shielded vs marked, whole frame (visual cost of δ) | ≥ 38 dB |
+| `shield_cost_ssim_ring` | SSIM (luma) of shielded vs marked over the context ring: the crop minus the logo + 8 px. Sees structured δ, like the decoy's glyph-like ghost on a flat background, that PSNR averages away | ≥ 0.95 |
 
 Always compare the `marked` and `shield-*` rows for the same case and remover: the
 shield has worked when the score drops.
@@ -86,8 +98,13 @@ Read the two scores together, and look at the images:
 ## Removers covered here vs by hand
 
 In `removers.py` (frame-level, Apache/MIT models):
-`oracle-lama` (hand-drawn mask, worst case), `florence-lama` (WatermarkRemover-AI style),
-`sam-lama` (IOPaint style).
+`oracle-lama` (hand-drawn mask, worst case), `loose-lama` (the same box dilated 24 px instead
+of 8), `florence-lama` (WatermarkRemover-AI style), `sam-lama` (IOPaint style).
+- All three hand-mask-like removers dilate by 8 px, except `loose-lama`. The real tools differ:
+  WatermarkRemover-AI's box mode inpaints the Florence-2 box **undilated** (`remwm.py`
+  `get_watermark_mask`), and IOPaint's click-to-mask dilates SAM's mask by ~4 px (9 px kernel
+  in `gen_frontend_mask`). Since the `lama` term is specific to the mask edge (README Phase 2),
+  these few px matter. Run the real tools by hand before trusting a harness number.
 
 By hand, from their own repos, on short clips (keep out of the shipped service):
 - WatermarkRemover-AI (https://github.com/D-Ogi/WatermarkRemover-AI): the actual tool, MIT.
@@ -110,7 +127,30 @@ torch/torchvision from the cu128 index last, because their requirements pull CPU
 
 ## Calibrating the codec proxy
 
-`fortify.eot.CodecProxy` approximates x264 with JPEG-style quantization. To calibrate:
-1. Pick a δ that was shielded without EOT (strength `low`).
-2. Compare how much of it survives `--codec h264:23` vs `--codec jpeg:<q>`. Measure the PSNR between shielded and marked after the codec.
-3. Set `CodecProxy.quality` to the JPEG range that matches the x264 CRFs you ship at.
+`fortify.eot.CodecProxy` approximates x264 with JPEG-style quantization.
+`calibrate_codec.py` measures how much of a δ survives each codec, inside each case's crop:
+`s = <c(x + δ) − c(x), δ> / <δ, δ>`, 1 = intact, 0 = erased. The test δs look like the
+attack's: random ±8 levels on a grid (1, 2 or 4 px), bilinear, feathered.
+
+```
+FFMPEG=... uv run python eval/calibrate_codec.py --clips      # ~5 min, CPU; log in runs/p2-calibrate.log
+```
+
+Phase 2 result (24 cases; clips = 48 frames of each clean clip, δ static on every frame):
+
+| codec | grid 1 | grid 2 | grid 4 | ≈ proxy quality |
+|---|---|---|---|---|
+| x264 CRF 18, one frame | 0.27 | 0.46 | 0.65 | q70–90 |
+| x264 CRF 23, one frame (eval's `h264:23`) | 0.09 | 0.25 | 0.50 | q30–50 |
+| x264 CRF 28, one frame | 0.02 | 0.13 | 0.34 | ≤ q20 |
+| x264 CRF 18, clip | 0.39 | 0.71 | 0.82 | q95 |
+| x264 CRF 23, clip | 0.25 | 0.45 | 0.66 | q70–90 |
+| x264 CRF 28, clip | 0.07 | 0.21 | 0.48 | q20–40 |
+| proxy / PIL JPEG q50 | 0.09 / 0.09 | 0.34 / 0.34 | 0.56 / 0.57 | |
+
+- The proxy's JPEG matches PIL's JPEG to within 0.005 at every quality: the DCT model is right.
+- A static δ survives about twice as well inside a clip as in a lone frame at the same CRF.
+- `CodecProxy.quality` is now q30–90 (was q45–85): it spans eval's I-frames at CRF 23 and
+  delivered clips at CRF 18–28.
+- Grid 1 keeps a third as much as grid 2 through one frame at CRF 23 (0.09 vs 0.25). This is
+  random δ, though; PGD through the proxy can find grid-1 patterns that survive better.

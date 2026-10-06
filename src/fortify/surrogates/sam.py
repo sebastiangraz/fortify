@@ -9,6 +9,9 @@ predicted mask comes back empty. Logits that are already below -tau stop countin
 Preprocessing is redone in torch so gradients reach the pixels. SAM pads the longest
 side to 1024 and SAM2 stretches to 1024², so bind() tries both against the real
 processor and keeps the one that matches.
+
+SAM2-large held 24.5 GiB for 2 frames × 2 EOT samples at 1024², so the loss is a SumLoss
+over chunks of `chunk` frames and pgd backpropagates one chunk at a time.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from dataclasses import dataclass
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..attack import LossFn
+from ..attack import LossFn, SumLoss
 from ..imageio import to_image
 from ..models import load_sam, normalize
 from .base import Context
@@ -31,6 +34,7 @@ SIDE = 1024
 class SamSurrogate:
     tau: float = 2.0
     dilate: int = 4
+    chunk: int = 1  # frames per backward
     name: str = "sam"
 
     def bind(self, ctx: Context) -> LossFn:
@@ -84,9 +88,15 @@ class SamSurrogate:
                 full[..., :rh, :rw], size=(h, w), mode="bilinear", align_corners=False
             )
 
-        def loss(x: Tensor) -> Tensor:
-            logits = logits_in_crop(x)
-            return ((F.relu(logits + self.tau) ** 2) * target).sum(dim=(1, 2, 3)).div(area).mean()
+        n = ctx.clean.shape[0]
 
-        self.logits_in_crop = logits_in_crop  # eval/ reuses it to measure mask area
-        return loss
+        def chunk_loss(lo: int, hi: int) -> LossFn:
+            def loss(x: Tensor) -> Tensor:
+                logits = logits_in_crop(x[lo:hi])
+                clip = (F.relu(logits + self.tau) ** 2) * target
+                return clip.sum(dim=(1, 2, 3)).div(area).sum() / n
+
+            return loss
+
+        self.logits_in_crop = logits_in_crop  # eval/ and lama's mask bank reuse it
+        return SumLoss(chunk_loss(k, min(n, k + self.chunk)) for k in range(0, n, self.chunk))

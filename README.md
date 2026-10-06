@@ -9,8 +9,8 @@ filters, layout or encoders.
 
 > **Status: first draft (2026-10-05).** The core attack, codec proxy, service, CLI, TS
 > client and eval harness are written. What has been run so far is in
-> [Status](#status). Phases 0 (baseline red-team) and 1 (single-frame shield) are done;
-> next is **Phase 2**, in [Roadmap](#roadmap).
+> [Status](#status). Phases 0 (baseline red-team) and 1 (single-frame shield) are done.
+> **Phase 2** (robustness) is partly done; what's left is in [Roadmap](#roadmap).
 
 ---
 
@@ -104,14 +104,20 @@ move.
 ### 3.3 The attack (`src/fortify/attack.py`)
 ```
 θ ← 0 on an (H/grid × W/grid) grid               # grid > 1 ⇒ δ is low-frequency by construction
+v ← 0
 repeat steps:
     δ = upsample_bilinear(θ) · feather
     L = mean over eot_samples of  loss(T(clip(x + δ)))   # x: (N,3,H,W) group, T: random codec proxy
-    θ ← clip(θ − α·sign(∇θ L), −ε, ε)
+    g = ∇θ L;  v ← μ·v + g / mean|g|                      # momentum (MI-FGSM), μ = 0.9; μ = 0 is plain PGD
+    θ ← clip(θ − α·sign(v), −ε, ε)
 δ = round(δ·255)/255                              # whole 8-bit levels (the output is 8-bit anyway)
 ```
 - `loss` returns something to **minimise**; each surrogate picks its own sign.
 - FGSM = one step with α = ε (the `low` preset).
+- **Momentum** (Dong et al. 2018) since Phase 2. Each step sees a different EOT draw: a
+  codec, and for `lama` a different attacker mask. Plain sign steps chase the latest draw and
+  oscillate; momentum steps where most draws agree. Without it, cycling `lama` over masks
+  broke nothing at all.
 - Bilinear upsampling is a convex combination, so |δ| ≤ ε still holds after it.
 - Optimizing on a coarse grid (grid = 2) puts δ's energy in low and mid frequencies,
   which survive 4:2:0 chroma and DCT quantization far better.
@@ -121,13 +127,17 @@ Each EOT sample draws a random chain, all differentiable:
 1. ±1 px shift;
 2. down/up-scale (×0.6–1.0, p = 0.4);
 3. Gaussian blur (σ ≤ 0.8, p = 0.3);
-4. JPEG-style 8×8 DCT quantization on YCbCr with 4:2:0 chroma (quality 45–85, p = 0.9),
+4. JPEG-style 8×8 DCT quantization on YCbCr with 4:2:0 chroma (quality 30–90, p = 0.9),
    rounding through a straight-through estimator;
 5. light noise.
 
 This approximates what x264 at Mark's CRFs and later platform re-encodes do. The quality
-range is a guess until calibrated with real x264 (`eval/README.md` → "Calibrating the
-codec proxy").
+range was calibrated against real x264 in Phase 2 (`eval/calibrate_codec.py`; table in
+`eval/README.md` → "Calibrating the codec proxy"):
+- One frame encoded alone at CRF 23 (eval's `h264:23`) erases a δ like JPEG q30–50.
+- Inside a clip, CRF 23 is like q70–90 and CRF 28 like q20–40, because P/B-frames predict a
+  static δ from the frame before.
+- q30–90 spans both. The proxy's JPEG itself matches PIL's to within 0.005.
 
 ### 3.5 Surrogates (`src/fortify/surrogates/`)
 Each surrogate's `bind(ctx)` sees the clean group once (to compute references and
@@ -135,9 +145,9 @@ targets) and returns `loss(x_adv)`.
 
 | name | stands in for | loss (minimised) | default weight |
 |---|---|---|---|
-| `lama` | LaMa inpainting with a dilated box mask (8 px) | −MSE between LaMa's fill on x_adv and its fill on clean, inside the hole (DWV-style: push the fill away from the plausible clean plate) | 1.0 |
+| `lama` | LaMa inpainting with the logo box as mask, dilated 8 and 24 px (one per call, in turn) | −MSE between LaMa's fill on x_adv and its fill on clean, inside the hole (DWV-style: push the fill away from the plausible clean plate) | 1.0 |
 | `sam` | SAM / SAM2 with the logo box as prompt | Attack-SAM ClipMSE: Σ relu(logit + τ)² over the (dilated) logo, τ = 2, so the mask comes back empty | 1.0 |
-| `florence2` | Florence-2 `<OPEN_VOCABULARY_DETECTION>` with "watermark" / "logo", on the whole frame | **targeted decoy**: CE of the clean answer with every box that covers the logo swapped for a decoy box in the ring beside it (see below) | 1.0 |
+| `florence2` | Florence-2 `<OPEN_VOCABULARY_DETECTION>` with "watermark" / "logo", on the whole frame | **targeted decoy**: CE of the clean answer with every box that covers most of the logo swapped for a decoy box in the ring beside it, plus a hinge that keeps the whole-logo box from getting likelier (see below) | 1.0 |
 | `toy` | a fixed random conv net | for tests and `selftest`; no weights | — |
 | `null` | nothing | constant loss ⇒ δ ≡ 0 exactly; for consumer smoke tests | — |
 
@@ -159,6 +169,14 @@ targets) and returns `loss(x_adv)`.
     strip beside the logo, 16 px clear of it and clear of the feathered border. PGD then
     descends the CE of the location tokens. WatermarkRemover-style tools inpaint the decoy
     strip and leave the mark.
+- **`lama` trains on a bank of attacker masks** (`LamaSurrogate.masks`, default `box:8,box:24`;
+  `sam:<px>` adds SAM's own mask). Its effect is specific to the mask's edge, so a mask the
+  bank doesn't contain gets a clean fill. See [Phase 2 results](#phase-2-results-2026-10-06).
+- **`florence2` keeps partial boxes.** Only a box covering ≥ 50% of the logo gets the decoy.
+  On large wordmarks the clean detector often boxes just the "S" (coverage ~0.25), and
+  decoying that box made it find the whole mark in Phase 1. A partial box stays the target,
+  which holds the miss. A hinge on the same answer with the whole logo boxed stops its CE
+  from dropping below its clean value.
 - **`florence2` needs the View** (`surrogates.View`: frame size, the crop's place in it, and a
   thumbnail of the frame; API field `view`, CLI `--view`/`--background`).
   - The real tool runs on the whole frame shrunk to 768². With a View, the surrogate builds that
@@ -189,11 +207,11 @@ targets) and returns `loss(x_adv)`.
     `facebook/sam2.1-hiera-large`.
 
 ### 3.6 Strength presets (`src/fortify/vaccinate.py`)
-| strength | method | ε | steps | α | EOT samples / step | grid |
-|---|---|---|---|---|---|---|
-| `low` | FGSM | 4/255 | 1 | 4/255 | — | 1 |
-| `medium` | PGD + EOT | 8/255 | 50 | 1.5/255 | 2 | 2 |
-| `high` | PGD + EOT | 12/255 | 100 | 1.5/255 | 4 | 2 |
+| strength | method | ε | steps | α | EOT samples / step | grid | momentum |
+|---|---|---|---|---|---|---|---|
+| `low` | R+FGSM | 4/255 | 1 | 2/255 | — | 1 | — |
+| `medium` | PGD + EOT | 8/255 | 50 | 1.5/255 | 2 | 2 | 0.9 |
+| `high` | PGD + EOT | 12/255 | 100 | 1.5/255 | 4 | 2 | 0.9 |
 
 Cost scales with steps × eot_samples × frames per group × surrogates. Measure it (Status)
 before promising a time budget to the consumer.
@@ -382,7 +400,8 @@ Environment variables:
 | LaMa (big-lama) | Apache-2.0 | surrogate + eval |
 | Florence-2 | MIT | surrogate + eval |
 | SAM / SAM2 | Apache-2.0 | surrogate + eval |
-| WDNet / SLBR weights | unverified | not used yet; check before adding as a `blind_remover` surrogate |
+| WDNet weights | unverified | not used |
+| SLBR code and weights | **none** (GitHub `null`, none in the README; checked 2026-10-06) | not usable as a `blind_remover` surrogate |
 | ProPainter | NTU S-Lab, **non-commercial** | eval by hand only, never in the service |
 | WatermarkRemover-AI / IOPaint | MIT / Apache-2.0 | eval by hand |
 
@@ -410,7 +429,72 @@ What has actually been run is recorded here. Keep it current.
 - [x] **Phase 1 single-frame shield, `lama` + `florence2` (2026-10-06).** Results are in
       [Phase 1 results](#phase-1-results-2026-10-06) below. `pytest` 15 passed, `bun test` 4 pass,
       ruff and tsc clean.
+- [x] **Phase 2 robustness, first pass (2026-10-06).** Results are in
+      [Phase 2 results](#phase-2-results-2026-10-06) below. `pytest` 17 passed, ruff clean.
 - [ ] Timing per group per preset with the full ensemble (`sam` included)
+
+### Phase 2 results (2026-10-06)
+
+**What changed**
+- `lama` trains on a bank of attacker masks (box dilated 8 and 24 px), one per call, in turn.
+- The PGD presets use momentum (μ = 0.9).
+- `florence2` keeps partial boxes as the target and holds off the whole-logo box (§3.5).
+- The codec proxy's quality range is calibrated: q30–90, was q45–85 (§3.4).
+- `sam` backpropagates frame by frame.
+- Eval gained a held-out attacker, `loose-lama` (box dilated 24 px), and a cost metric, ring
+  SSIM. `eval/summary.py` prints the tables below; on `runs/p1-medium` it reproduces Phase 1's
+  table exactly.
+
+**Eval:** `eval/run.py --shield medium --surrogates lama,florence2 --codec h264:23,none`, all 24
+cases, output in `runs/p2-medium`. Cases removed out of 24 (marked → shielded), same counting as
+Phase 1:
+
+| attacker | h264:23, Phase 1 | h264:23, Phase 2 | no codec, Phase 2 | mask off / onto (h264:23) |
+|---|---|---|---|---|
+| `florence-lama` (WatermarkRemover-style) | 17 → 15 | 17 → **7** | 17 → 7 | **10 off / 0 onto** (Phase 1: 4 / 3) |
+| `oracle-lama` (box + 8 px) | 19 → 8 | 19 → 11 | 21 → 10 | — |
+| `loose-lama` (box + 24 px) | not run | 18 → 12 | 18 → 9 | — |
+| `sam-lama` (SAM mask + 8 px) | 21 → 19 | 21 → 20 | 21 → 20 | 0 / 0 |
+
+- Shield cost: PSNR 44.7 dB mean, 38.7 dB worst (Phase 1: 46.2 / 40.2). Ring SSIM 0.90 mean;
+  worst sintel22-glass-medium 0.78, sintel12-blur 0.83, sintel22-plain-large 0.84. That misses
+  the ≥ 0.95 target in eval/README: δ is visible on flat backgrounds.
+- Time: 30 s per single-frame group on average, 42 s at most, the same as Phase 1.
+
+What the numbers say:
+- **The detector term is now the strong one, and it survives H.264.**
+  - Florence-2 misses the logo on 10 of 24 cases after x264 CRF 23, against 4 in Phase 1.
+  - **No mask moves onto the logo any more.** On kodim13, sintel19 and sintel22-plain-large
+    (Phase 1's backfires) it keeps boxing only the "S" (coverage ~0.25, was 1.0).
+  - Momentum is probably most of the H.264 gain. The decoy fix alone (probe, before momentum)
+    stopped the backfires but didn't add wins.
+- **The `lama` term is specific to the mask's edge.** This is the main Phase 2 finding. A lama-only
+  probe on 3–4 Sintel/smoke cases (`removed_psnr_logo`, lower = more broken fill):
+  - A δ trained on the 8 px box breaks that box (5–10 dB). The 24 px box and the SAM mask on the
+    same frame get clean fills (25–35 dB).
+  - Training on boxes 4/20/36 px broke nothing, including the 8 and 24 px boxes. **A mask edge
+    4 px off is enough to escape.** The δ that breaks LaMa sits right at the hole's edge.
+  - Masks a few px apart (4/8/16 + SAM) fight over the same pixels and break nothing, even
+    summed on every call at 4× the cost. Masks 16 px apart (8 and 24) coexist. Hence the default.
+  - Cycling masks without momentum broke nothing; with momentum it costs the same as one mask.
+  - No setup broke the 40 px box, and a SAM mask in the bank broke SAM-masked fills only weakly
+    (24 dB at best) while diluting the boxes.
+  - In the full eval: `oracle-lama` is defended a bit less than in Phase 1 (11 vs 8 removed),
+    and `loose-lama` gains the same (18 → 12). `sam-lama` is still untouched.
+- **So `lama` defends against masks we can predict, not against a hand-drawn one.** The real
+  tools' masks are predictable: WatermarkRemover-AI inpaints Florence-2's box *undilated*, and
+  IOPaint's click-to-mask dilates SAM's mask by ~4 px. Our harness dilates both by 8 px, so
+  its `florence-lama`/`sam-lama` lama numbers don't transfer one to one (eval/README).
+- **Grid 1 for medium doesn't pay** (`runs/p2-medium-grid1`): `florence-lama` 17 → 9 under H.264
+  (grid 2: 7), `oracle-lama` 19 → 13 (11), and it costs more: PSNR 42.9 dB, ring SSIM 0.80
+  (grid 2: 0.90). Medium stays at grid 2. Phase 1's sweep, where grid 1 flipped the decoy on
+  sintel03, predates momentum.
+- **Codec calibration** (eval/README → "Calibrating the codec proxy"): a lone frame at CRF 23
+  (eval's `h264:23`) erases about twice as much of a static δ as a clip at CRF 23. Eval's H.264
+  numbers are a pessimistic bound.
+- **`sam` with frame chunking:** 3 frames of a 430×240 crop take ~1 s per step at 6.9 GiB peak
+  (1 frame: 6.8 GiB). Phase 0 had 24.5 GiB for 2 frames. Not yet run in a full eval.
+- **SLBR has no licence**, so the optional `blind_remover` surrogate is off the table (§8).
 
 ### Phase 1 results (2026-10-06)
 
@@ -618,23 +702,30 @@ Still unverified:
     after `h264:23`. `jpeg:75` was not run.
   - Added on the way: the targeted decoy loss, the View (API field `view`), balanced ensemble
     gradients, and per-sample/per-surrogate/per-chunk backward.
-- **Phase 2, robustness.** Ordered by what Phase 1 showed:
-  - **`lama` over mask shapes.** EOT over the attacker's mask: box at several dilations, a
-    stroke/SAM-like mask. Today's δ doesn't touch `sam-lama`.
-  - **Decoy fixes:**
-    - On large logos where clean Florence-2 boxes only part of the mark, don't let the attack
-      fall onto the whole mark: also ascend the CE of a whole-logo box, or target the decoy only
-      where the clean box already covers the logo.
-    - Look for a decoy shape that isn't a ghost wordmark (smaller, textured, or at the frame
-      edge). Add a perceptual cost metric (e.g. LPIPS/SSIM in the ring), since PSNR hides the
-      ghost.
-  - **Preset budget:** test grid 1 for medium (it flipped the decoy at ε = 8 on Sintel where
-    grid 2 didn't), and whether `high` (ε = 12) is acceptable visually.
-  - Calibrate the codec proxy. H.264 halved the decoy's wins (8 → 4).
-  - Add and tune the `sam` surrogate (frame chunking first), and tune the ensemble weights.
-  - Per-stay universal δ over sampled frames.
-  - Optionally a `blind_remover` surrogate (SLBR) if its licence allows.
-  - Hold out MAT/SD inpainting to measure transfer.
+- **Phase 2, robustness: first pass done 2026-10-06, results in [Status](#phase-2-results-2026-10-06).**
+  - Done:
+    - `lama` over mask shapes, with momentum; default bank box 8 + 24 px. It defends exactly the
+      masks it trains on, not a hand-drawn one.
+    - The decoy no longer backfires on large logos (partial boxes kept, whole-logo hinge).
+    - Ring SSIM as a cost metric.
+    - Grid 1 for medium was tested and rejected.
+    - The codec proxy is calibrated.
+    - `sam` has frame chunking.
+    - SLBR was checked and has no licence.
+  - Left, in order:
+    - **Match the real tools' masks.** Add `box:0` (WatermarkRemover-AI inpaints Florence-2's box
+      undilated) to the bank, and make the harness's `florence-lama` and `sam-lama` dilate like
+      the real tools (0 px and ~4 px). Then re-run WatermarkRemover-AI and IOPaint by hand on
+      shielded frames.
+    - **The decoy's visibility.** Ring SSIM is 0.90 on average and 0.78 at worst. Try a smaller
+      or textured decoy, or put the SSIM term into the loss. Eyeball the worst cases first.
+    - **`sam` in a full eval**, and the ensemble weights. Static marks are where SAM2 propagation
+      works (Phase 0).
+    - Whether `high` (ε = 12) is acceptable visually.
+    - A per-stay universal δ over sampled frames, scored on whole clips. This would also check
+      the calibration finding that delivery keeps more δ than eval's lone frames.
+    - Hold out MAT/SD inpainting (IOPaint, by hand) to measure transfer. Eval needs to save the
+      delivered shielded frames for that.
 - **Phase 3, service.** Deploy (Modal or self-hosted 5090), latency measurements, a
   timing-aware strength choice. Phase 1 timing is ~35 s per 1-frame group and ~67 s per 3-frame
   group (largest crop, medium), so a multi-stay job needs fewer steps or async jobs.

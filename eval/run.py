@@ -1,7 +1,7 @@
 """Red-team a set of frames: run real removers on marked (and shielded) frames after a codec.
 
 Usage:
-  uv run python eval/run.py --data eval/data [--shield medium] [--codec h264:28[,none,...]] [--removers oracle-lama,florence-lama] [--cases 'sintel*']
+  uv run python eval/run.py --data eval/data [--shield medium] [--codec h264:28[,none,...]] [--removers oracle-lama,florence-lama] [--cases 'sintel*'] [--tune grid=1,eps=12]
 
 Data layout (one directory per case; frames exported from videotools, see eval/README.md):
   eval/data/<case>/clean.png    the frame without the mark
@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from removers import REMOVERS
 
 from fortify.attack import apply_delta
+from fortify.eot import gaussian_blur
 from fortify.imageio import load_png, save_png, to_image, to_tensor
 from fortify.models import device
 from fortify.region import Rect, crop_around
@@ -109,6 +110,31 @@ def psnr(mse: float) -> float:
     return 99.0 if mse <= 1e-12 else 10 * math.log10(1 / mse)
 
 
+def ssim_ring(a: torch.Tensor, b: torch.Tensor, logo: Rect) -> float:
+    """Mean SSIM of luma between a and b over the context ring: the crop minus the logo + 8 px.
+
+    The visual cost of δ where it lives. PSNR averages the error away; SSIM's structure term
+    sees a faint glyph-like pattern on a flat background (the decoy ghost) that PSNR doesn't.
+    """
+    h, w = a.shape[-2:]
+    x0, y0, x1, y1 = crop_around(logo, w, h).xyxy()
+    luma = lambda t: (t[:, :1] * 0.299 + t[:, 1:2] * 0.587 + t[:, 2:3] * 0.114)[..., y0:y1, x0:x1]
+    a, b = luma(a), luma(b)
+    mu_a, mu_b = gaussian_blur(a, 1.5), gaussian_blur(b, 1.5)
+    var_a = gaussian_blur(a * a, 1.5) - mu_a**2
+    var_b = gaussian_blur(b * b, 1.5) - mu_b**2
+    cov = gaussian_blur(a * b, 1.5) - mu_a * mu_b
+    c1, c2 = 0.01**2, 0.03**2
+    ssim = ((2 * mu_a * mu_b + c1) * (2 * cov + c2)) / (
+        (mu_a**2 + mu_b**2 + c1) * (var_a + var_b + c2)
+    )
+    ring = torch.ones_like(ssim)
+    inner = Rect(logo.x - x0 - 8, logo.y - y0 - 8, logo.w + 16, logo.h + 16)
+    ix0, iy0, ix1, iy1 = inner.clipped(x1 - x0, y1 - y0).xyxy()
+    ring[..., iy0:iy1, ix0:ix1] = 0
+    return float((ssim * ring).sum() / ring.sum())
+
+
 def thumbnail(x: torch.Tensor, side: int = THUMB) -> torch.Tensor:
     """The frame shrunk to `side` px on its long side: the View background a consumer sends."""
     h, w = x.shape[-2:]
@@ -117,7 +143,12 @@ def thumbnail(x: torch.Tensor, side: int = THUMB) -> torch.Tensor:
 
 
 def shield(
-    marked: torch.Tensor, logo: Rect, strength: str, surrogates: str, view: bool = True
+    marked: torch.Tensor,
+    logo: Rect,
+    strength: str,
+    surrogates: str,
+    view: bool = True,
+    tune: dict | None = None,
 ) -> tuple[torch.Tensor, float, dict[str, float]]:
     """Shield like the consumer would; also returns the ms spent and each surrogate's final loss."""
     h, w = marked.shape[-2:]
@@ -125,9 +156,8 @@ def shield(
     x0, y0, x1, y1 = crop.xyxy()
     inner = Rect(logo.x - crop.x, logo.y - crop.y, logo.w, logo.h)
     v = View((w, h), (crop.x, crop.y), thumbnail(marked).cpu()) if view else None
-    r = vaccinate(
-        Group(marked[..., y0:y1, x0:x1].cpu(), inner, "eval", v), ensemble(surrogates), strength
-    )
+    group = Group(marked[..., y0:y1, x0:x1].cpu(), inner, "eval", v)
+    r = vaccinate(group, ensemble(surrogates), strength, tune=tune)
     full = torch.zeros_like(marked)
     full[..., y0:y1, x0:x1] = r.delta.to(marked)
     return apply_delta(marked, full), r.ms, r.terms[-1] if r.terms else {}
@@ -144,15 +174,25 @@ def main() -> int:
         help="none | jpeg:<q> | h264:<crf>, applied before removal; comma-separate several to "
         "score the same δ under each",
     )
-    p.add_argument("--cases", default="*", help="glob on case directory names")
+    p.add_argument("--cases", default="*", help="globs on case directory names, comma-separated")
     p.add_argument(
         "--no-view",
         action="store_true",
         help="shield from the crop alone, without telling surrogates where it sits in the frame",
     )
+    p.add_argument(
+        "--tune",
+        default="",
+        help="override preset fields, e.g. grid=1,steps=100,eps=12 (eps and alpha in 8-bit levels)",
+    )
     p.add_argument("--removers", default=",".join(REMOVERS))
     p.add_argument("--out", default=f"runs/eval-{time.strftime('%Y%m%d-%H%M%S')}")
     args = p.parse_args()
+
+    tune = {}
+    for part in filter(None, args.tune.split(",")):
+        key, _, value = part.partition("=")
+        tune[key] = float(value) / 255 if key in ("eps", "alpha") else type_of(key)(value)
 
     dev = device()
     out = Path(args.out)
@@ -161,7 +201,8 @@ def main() -> int:
     cases = sorted(
         d
         for d in Path(args.data).iterdir()
-        if (d / "marked.png").exists() and fnmatch.fnmatch(d.name, args.cases)
+        if (d / "marked.png").exists()
+        and any(fnmatch.fnmatch(d.name, g) for g in args.cases.split(","))
     )
     if not cases:
         raise SystemExit(f"no cases under {args.data} (see eval/README.md)")
@@ -172,7 +213,7 @@ def main() -> int:
         variants = {"marked": (marked, 0.0, {})}
         if args.shield:
             variants[f"shield-{args.shield}"] = shield(
-                marked, logo, args.shield, args.surrogates, not args.no_view
+                marked, logo, args.shield, args.surrogates, not args.no_view, tune
             )
         for (vname, (frame, ms, terms)), spec in product(variants.items(), args.codec.split(",")):
             sent = codec(frame, spec)
@@ -192,6 +233,7 @@ def main() -> int:
                     "mark_residual": round(mark_residual(restored, marked, clean, logo), 4),
                     "removed_psnr_logo": round(psnr(err), 2),
                     "shield_cost_psnr": round(psnr(float(((frame - marked) ** 2).mean())), 2),
+                    "shield_cost_ssim_ring": round(ssim_ring(frame, marked, logo), 4),
                     "shield_ms": round(ms),
                     **{f"loss_{k}": round(v, 4) for k, v in terms.items()},
                     **{k: round(v, 4) if isinstance(v, float) else v for k, v in info.items()},
@@ -209,6 +251,12 @@ def main() -> int:
         writer.writerows(rows)
     print(f"→ {out / 'results.csv'}")
     return 0
+
+
+def type_of(key: str):
+    from fortify.attack import AttackConfig
+
+    return type(getattr(AttackConfig(), key))
 
 
 if __name__ == "__main__":

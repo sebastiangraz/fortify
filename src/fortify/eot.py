@@ -6,8 +6,14 @@ light blur). Rounding uses a straight-through estimator (forward = round, backwa
 
 H.264 is approximated by an 8×8 DCT quantizer (JPEG tables) on YCbCr with 4:2:0 chroma.
 That is not H.264's integer transform, but it removes the same high frequencies,
-which is what kills naive perturbations. Calibrate the quality range against real
-x264 output with eval/ (see README "Calibrating the codec proxy").
+which is what kills naive perturbations. The quality range is calibrated against real
+x264 with eval/calibrate_codec.py (Phase 2, see eval/README "Calibrating the codec proxy"):
+how much of a ±8-level δ survives, at Mark's settings (`-preset fast`):
+- one frame encoded alone (an I-frame; eval's `h264:<crf>`): CRF 18 ≈ q70–90,
+  CRF 23 ≈ q30–50, CRF 28 ≈ q20 or lower;
+- inside a clip (P/B-frames predict a static δ from the frame before, so more survives):
+  CRF 18 ≈ q95, CRF 23 ≈ q70–90, CRF 28 ≈ q20–40.
+q30–90 spans both. The proxy itself matches PIL's JPEG to within 0.005 survival.
 """
 
 from __future__ import annotations
@@ -149,7 +155,7 @@ def shift(x: Tensor, dx: int, dy: int) -> Tensor:
 class CodecProxy:
     """Random draw of the post-processing chain, called once per EOT sample."""
 
-    quality: tuple[float, float] = (45, 85)
+    quality: tuple[float, float] = (30, 90)
     p_jpeg: float = 0.9
     resize: tuple[float, float] = (0.6, 1.0)
     p_resize: float = 0.4
